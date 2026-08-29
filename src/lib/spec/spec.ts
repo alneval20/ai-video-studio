@@ -147,6 +147,12 @@ export const ReferenceDirective = z.object({
   shotIds: z.array(z.string()).nullable().default(null),
   /** What specifically must be preserved from this image. */
   preserve: z.array(z.string().min(1)).default([]),
+  /**
+   * Model-facing description of the image, used when no conditioning hook
+   * exists. Deliberately separate from `notes`: notes explain provider
+   * limitations to the operator, and that plumbing must never reach a prompt.
+   */
+  promptDescription: z.string().default(""),
   notes: z.string().max(400).default(""),
 });
 export type ReferenceDirective = z.infer<typeof ReferenceDirective>;

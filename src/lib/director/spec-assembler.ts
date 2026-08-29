@@ -31,6 +31,8 @@ export interface AssembleSpecInput {
     supportedReferenceUsages: import("@/lib/spec/vocab").ReferenceUsage[];
     /** Generation resolution ceiling on the long edge. */
     maxGenerationEdge: number;
+    /** Exact validated sizes, when the provider is constrained to a set. */
+    supportedGenerationSizes?: ReadonlyArray<{ width: number; height: number }>;
     maxFps: number;
     maxClipSeconds: number;
     options?: Record<string, unknown>;
@@ -72,7 +74,11 @@ export function assembleSpec(input: AssembleSpecInput): AssembleSpecResult {
   // --- delivery ------------------------------------------------------------
   const formatDefaults = FORMAT_DEFAULTS[brief.format];
   const totalDurationSec = clamp(brief.targetDurationSec, 2, formatDefaults.maxDurationSec);
-  const generation = generationResolution(formatDefaults.aspectRatio, input.provider.maxGenerationEdge);
+  const generation = chooseGenerationSize(
+    formatDefaults.aspectRatio,
+    input.provider.maxGenerationEdge,
+    input.provider.supportedGenerationSizes,
+  );
   const generationFps = Math.min(24, input.provider.maxFps);
 
   if (generation.width !== formatDefaults.exportWidth) {
@@ -296,6 +302,32 @@ export function assembleSpec(input: AssembleSpecInput): AssembleSpecResult {
  * provider's ceiling, snapped to a multiple of 16 (every diffusion video model
  * in practice requires this, and silently rounding produces stretched output).
  */
+/**
+ * Picks the generation resolution.
+ *
+ * When the provider publishes validated sizes, choose from them: the closest
+ * aspect match, largest first. Deriving a size instead risks violating the
+ * model's spatial stride — a 16-aligned guess like 688x1216 is invalid for a
+ * model requiring multiples of 32, and fails inside the VAE on the GPU.
+ */
+export function chooseGenerationSize(
+  aspectRatio: AspectRatio,
+  maxEdge: number,
+  supported?: ReadonlyArray<{ width: number; height: number }>,
+): { width: number; height: number } {
+  if (!supported || supported.length === 0) {
+    return generationResolution(aspectRatio, maxEdge);
+  }
+  const target = ASPECT_RATIO_VALUE[aspectRatio];
+  return [...supported]
+    .sort((a, b) => {
+      const da = Math.abs(a.width / a.height - target);
+      const db = Math.abs(b.width / b.height - target);
+      if (Math.abs(da - db) > 0.001) return da - db;
+      return b.width * b.height - a.width * a.height;
+    })[0];
+}
+
 export function generationResolution(
   aspectRatio: AspectRatio,
   maxEdge: number,

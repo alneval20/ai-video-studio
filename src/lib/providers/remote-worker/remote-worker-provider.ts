@@ -91,6 +91,7 @@ export class RemoteWorkerProvider implements VideoProvider {
     supportsNegativePrompt: true,
 
     maxGenerationEdge: largest.height,
+    supportedGenerationSizes: profile.sizes,
     maxFps: profile.fps,
     maxClipSeconds: profile.maxClipSeconds,
     promptStyle: "structured_blocks",

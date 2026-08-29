@@ -31,6 +31,7 @@ const productRef: ReferenceDirective = {
   label: "cup.png",
   role: "product",
   usage: "identity",
+  promptDescription: "the branded cup",
   adherence: "strict",
   weight: 1,
   shotIds: null,

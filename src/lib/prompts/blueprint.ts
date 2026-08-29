@@ -209,8 +209,12 @@ function describeReferences(refs: ReferenceDirective[]): string[] {
         lines.push(`Take colour palette, contrast and texture from the supplied style reference — content is not copied from it.`);
         break;
       case "descriptive_only":
-        // The model has no image hook, so the words have to carry it.
-        lines.push(`Reproduce faithfully: ${ref.notes || ref.label}. Preserve ${preserve}.`);
+        // The model has no image hook, so the words have to carry it. Uses the
+        // model-facing description, not `notes` — notes explain provider
+        // limitations to the operator and would be noise inside a prompt.
+        lines.push(
+          `Reproduce faithfully: ${ref.promptDescription || ref.label}. Preserve ${preserve}.`,
+        );
         break;
     }
   }

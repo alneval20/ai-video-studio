@@ -138,6 +138,8 @@ export function resolveReferences(input: ResolveReferencesInput): ReferenceDirec
       weight: Number(weight.toFixed(3)),
       shotIds: shotScope(ref.role, input),
       preserve: preservationList(ref.role),
+      // Only what the image shows — never why the provider degraded it.
+      promptDescription: ref.notes.trim() || defaults.description,
       notes: [defaults.description, ref.notes, ...notes].filter(Boolean).join(" "),
     } satisfies ReferenceDirective;
   });

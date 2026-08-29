@@ -26,6 +26,13 @@ export interface ProviderCapabilities {
 
   /** Longest edge, in pixels, this provider should be asked to render. */
   maxGenerationEdge: number;
+  /**
+   * Exact sizes this provider is validated for, if it is constrained to a set.
+   * When present the spec assembler picks from these rather than deriving a
+   * resolution, because derived sizes can violate a model's spatial stride —
+   * LTX needs multiples of 32, and a 16-aligned guess is rejected by its VAE.
+   */
+  supportedGenerationSizes?: ReadonlyArray<{ width: number; height: number }>;
   maxFps: number;
   /** Longest single clip in seconds. Longer shots get trimmed by the assembler. */
   maxClipSeconds: number;

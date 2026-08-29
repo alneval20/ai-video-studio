@@ -231,6 +231,7 @@ async function main() {
       supportsInitFrame: provider.capabilities.supportsInitFrame,
       supportedReferenceUsages: provider.capabilities.supportedReferenceUsages,
       maxGenerationEdge: provider.capabilities.maxGenerationEdge,
+      supportedGenerationSizes: provider.capabilities.supportedGenerationSizes,
       maxFps: provider.capabilities.maxFps,
       maxClipSeconds: provider.capabilities.maxClipSeconds,
     },
