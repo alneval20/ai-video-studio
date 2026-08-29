@@ -13,7 +13,6 @@
  *   node --import tsx scripts/build-campaign.ts
  */
 import fs from "node:fs/promises";
-import path from "node:path";
 import { assembleSpec } from "@/lib/director";
 import { compileSpec } from "@/lib/prompts/prompt-compiler";
 import { getProvider } from "@/lib/providers/registry";
