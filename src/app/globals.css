@@ -1,26 +1,107 @@
 @import "tailwindcss";
 
+/*
+ * A restrained, dark studio palette. The interface should feel like a tool,
+ * not a toy — the sophistication belongs in the engine, not the chrome.
+ */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --bg: #0b0b0e;
+  --bg-elevated: #131318;
+  --bg-input: #17171d;
+  --border: #26262f;
+  --border-strong: #35353f;
+  --fg: #edecf0;
+  --fg-muted: #9a99a5;
+  --fg-subtle: #6b6a76;
+  --accent: #c9a227;
+  --accent-soft: rgba(201, 162, 39, 0.12);
+  --danger: #e5484d;
+  --warning: #f5a524;
+  --success: #46a758;
+  --info: #6e8ef7;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --color-bg: var(--bg);
+  --color-elevated: var(--bg-elevated);
+  --color-input: var(--bg-input);
+  --color-line: var(--border);
+  --color-line-strong: var(--border-strong);
+  --color-fg: var(--fg);
+  --color-muted: var(--fg-muted);
+  --color-subtle: var(--fg-subtle);
+  --color-accent: var(--accent);
+  --color-danger: var(--danger);
+  --color-warning: var(--warning);
+  --color-success: var(--success);
+  --color-info: var(--info);
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Monaco, "Cascadia Code", monospace;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html,
+body {
+  background: var(--bg);
+  color: var(--fg);
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+
+/* Scrollbars that don't fight the dark theme. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+/* Shared primitives — used often enough to justify a class. */
+@layer components {
+  .field-label {
+    @apply mb-2 block text-[11px] font-medium uppercase tracking-[0.14em] text-[var(--fg-subtle)];
+  }
+
+  .input {
+    @apply w-full rounded-lg border border-[var(--border)] bg-[var(--bg-input)] px-3 py-2.5
+           text-sm text-[var(--fg)] outline-none transition
+           placeholder:text-[var(--fg-subtle)]
+           focus:border-[var(--accent)] focus:ring-1 focus:ring-[var(--accent)];
+  }
+
+  .card {
+    @apply rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)];
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-md border border-[var(--border)]
+           bg-[var(--bg-input)] px-2 py-1 text-[11px] text-[var(--fg-muted)];
+  }
+}
+
+@keyframes pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+.animate-pulse-soft {
+  animation: pulse-soft 1.6s ease-in-out infinite;
 }

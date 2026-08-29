@@ -39,3 +39,19 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# --- AI Video Studio ---
+# Runtime data: projects, jobs, uploaded reference images, generated clips.
+/storage/**
+!/storage/.gitkeep
+/outputs/**
+!/outputs/.gitkeep
+# But DO keep the environment template.
+!.env.example
+
+# Python worker
+worker/.venv/
+worker/__pycache__/
+**/__pycache__/
+*.pyc
+worker/models/

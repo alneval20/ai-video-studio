@@ -1,0 +1,27 @@
+# AI Video Studio — GPU worker
+#
+# Target: Python 3.10–3.12 on an NVIDIA/CUDA host.
+# (Python 3.13+ has incomplete wheel coverage for the ML stack.)
+#
+# Install torch FIRST, matched to the host's CUDA version, e.g. for CUDA 12.1:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# then:
+#   pip install -r requirements.txt
+
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.7,<3.0
+python-multipart>=0.0.9
+
+# --- model stack (installed on the GPU host) ---
+diffusers>=0.32.0
+transformers>=4.44.0
+accelerate>=0.34.0
+safetensors>=0.4.3
+sentencepiece>=0.2.0
+imageio>=2.34.0
+imageio-ffmpeg>=0.5.1
+Pillow>=10.3.0
+
+# torch is intentionally NOT pinned here — the correct build depends on the
+# host's CUDA version. See the note above.

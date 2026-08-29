@@ -1,24 +1,35 @@
-import { dirname } from "path";
-import { fileURLToPath } from "url";
-import { FlatCompat } from "@eslint/eslintrc";
+import nextCoreWebVitals from "eslint-config-next/core-web-vitals";
+import nextTypeScript from "eslint-config-next/typescript";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-const compat = new FlatCompat({
-  baseDirectory: __dirname,
-});
-
+/**
+ * Flat config for eslint-config-next 16. (The FlatCompat shim that
+ * create-next-app 15 emitted is incompatible with the v16 config package.)
+ */
 const eslintConfig = [
-  ...compat.extends("next/core-web-vitals", "next/typescript"),
   {
     ignores: [
       "node_modules/**",
       ".next/**",
       "out/**",
       "build/**",
+      "storage/**",
+      "outputs/**",
+      "worker/**",
       "next-env.d.ts",
     ],
+  },
+  ...nextCoreWebVitals,
+  ...nextTypeScript,
+  {
+    rules: {
+      // Domain code deliberately narrows `unknown` by hand at trust boundaries
+      // (LLM output, JSON files, form data); a targeted cast there is correct.
+      "@typescript-eslint/no-explicit-any": "error",
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        { argsIgnorePattern: "^_", varsIgnorePattern: "^_" },
+      ],
+    },
   },
 ];
 
