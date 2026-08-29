@@ -23,6 +23,10 @@ const adapterTs = fs.readFileSync(
   path.join(root, "src/lib/providers/remote-worker/remote-worker-provider.ts"),
   "utf8",
 );
+const profilesTs = fs.readFileSync(
+  path.join(root, "src/lib/providers/remote-worker/profiles.ts"),
+  "utf8",
+);
 
 /** String values of a Python `str, Enum` class. */
 function pythonEnumValues(source: string, className: string): string[] {
@@ -87,26 +91,82 @@ describe("GenerationRequest: TypeScript sends what Python requires", () => {
   });
 });
 
-describe("Wan 2.2 production profile", () => {
-  it("pins the same exact model and profile on both sides", () => {
-    expect(adapterTs).toContain('Wan-AI/Wan2.2-I2V-A14B-Diffusers');
-    expect(modelProfilesPy).toContain('Wan-AI/Wan2.2-I2V-A14B-Diffusers');
-    expect(adapterTs).toContain('wan2.2-i2v-a14b-720p');
-    expect(modelProfilesPy).toContain('wan2.2-i2v-a14b-720p');
+describe("model profiles agree across the wire", () => {
+  /** Parse a profile's scalar fields from the TS registry. */
+  function tsProfile(constName: string): Record<string, string> {
+    const start = profilesTs.indexOf(`export const ${constName}: I2vProfile = {`);
+    expect(start, `TS profile ${constName} not found`).toBeGreaterThan(-1);
+    const body = profilesTs.slice(start, profilesTs.indexOf("\n};", start));
+    const fields: Record<string, string> = {};
+    for (const m of body.matchAll(/^\s{2}(\w+):\s*(.+?),\s*$/gm)) fields[m[1]] = m[2];
+    return fields;
+  }
+
+  /** Parse a profile's scalar fields from the Python registry. */
+  function pyProfile(constName: string): Record<string, string> {
+    const start = modelProfilesPy.indexOf(`${constName} = ModelProfile(`);
+    expect(start, `Python profile ${constName} not found`).toBeGreaterThan(-1);
+    const body = modelProfilesPy.slice(start, modelProfilesPy.indexOf("\n)", start));
+    const fields: Record<string, string> = {};
+    for (const m of body.matchAll(/^\s{4}(\w+)=(.+?),\s*$/gm)) fields[m[1]] = m[2];
+    return fields;
+  }
+
+  it.each([
+    ["WAN_I2V", "wan2.2-i2v-a14b-720p", "Wan-AI/Wan2.2-I2V-A14B-Diffusers"],
+    ["LTX_I2V", "ltx-2b-i2v-576p", "Lightricks/LTX-Video"],
+  ])("%s pins the same id and checkpoint on both sides", (constName, id, modelId) => {
+    const ts = tsProfile(constName);
+    const py = pyProfile(constName);
+
+    expect(ts.id).toContain(id);
+    expect(py.profile_id).toContain(id);
+    expect(ts.modelId).toContain(modelId);
+    expect(py.model_id).toContain(modelId);
   });
 
-  it("uses the real image-to-video pipeline and explicit H.264 export", () => {
+  it.each([["WAN_I2V"], ["LTX_I2V"]])(
+    "%s agrees on fps and the VAE strides that decide validity",
+    (constName) => {
+      const ts = tsProfile(constName);
+      const py = pyProfile(constName);
+
+      // A stride mismatch is the dangerous one: the request validates on one
+      // side and is rejected by the VAE on the other, on a GPU, minutes in.
+      expect(ts.fps).toBe(py.fps);
+      expect(ts.temporalStride).toBe(py.temporal_stride);
+      expect(ts.spatialStride).toBe(py.spatial_stride);
+    },
+  );
+
+  it("schema Literal covers exactly the registered profiles", () => {
+    const literal = /model_profile: Literal\[([^\]]+)\]/.exec(schemasPy)?.[1] ?? "";
+    const declared = [...literal.matchAll(/"([^"]+)"/g)].map((m) => m[1]).sort();
+    const registered = [...modelProfilesPy.matchAll(/profile_id="([^"]+)"/g)]
+      .map((m) => m[1])
+      .sort();
+
+    expect(declared).toEqual(registered);
+  });
+
+  it("uses the real image-to-video pipelines and explicit H.264 export", () => {
     expect(pipelinePy).toContain("WanImageToVideoPipeline");
+    expect(pipelinePy).toContain("LTXImageToVideoPipeline");
     expect(pipelinePy).toContain('codec="libx264"');
     expect(pipelinePy).toContain('pixelformat="yuv420p"');
     expect(pipelinePy).not.toContain("DiffusionPipeline.from_pretrained");
   });
 
-  it("enforces native vertical, 24 fps and 4n+1 frames before queueing", () => {
-    expect(modelProfilesPy).toContain("(720, 1280)");
-    expect(modelProfilesPy).toContain("WAN_I2V_FPS = 24");
-    expect(modelProfilesPy).toContain("(request.num_frames - 1) % 4");
+  it("validates every request against its profile before queueing", () => {
+    expect(modelProfilesPy).toContain("(request.num_frames - 1) % profile.temporal_stride");
+    expect(modelProfilesPy).toContain("profile.spatial_stride");
     expect(mainPy).toContain("validate_generation_request(request)");
+  });
+
+  it("derives duration from the frame count so the two cannot disagree", () => {
+    // The worker rejects num_frames more than one frame from duration*fps.
+    expect(adapterTs).toContain("durationForFrames");
+    expect(adapterTs).toContain("num_frames: frames");
   });
 });
 

@@ -14,20 +14,45 @@ import type {
   VideoProvider,
 } from "../types";
 
+import {
+  durationForFrames,
+  frameCountFor,
+  getI2vProfile,
+  largestSize,
+  WAN_I2V,
+  type I2vProfile,
+} from "./profiles";
+
 const log = createLogger("provider:remote-worker");
 
-export const WAN_I2V_MODEL_ID = "Wan-AI/Wan2.2-I2V-A14B-Diffusers";
-export const WAN_I2V_PROFILE = "wan2.2-i2v-a14b-720p";
-export const WAN_I2V_FPS = 24;
-export const WAN_I2V_VERTICAL_SIZES = [
-  { width: 720, height: 1280 },
-  { width: 480, height: 832 },
-] as const;
+export const WAN_I2V_MODEL_ID = WAN_I2V.modelId;
+export const WAN_I2V_PROFILE = WAN_I2V.id;
+export const WAN_I2V_FPS = WAN_I2V.fps;
+export const WAN_I2V_VERTICAL_SIZES = WAN_I2V.sizes;
 
-/** Wan's temporal VAE requires a 4n+1 frame count. */
-export function wanFrameCount(durationSec: number, fps = WAN_I2V_FPS): number {
-  const nominal = Math.max(1, Math.round(durationSec * fps));
-  return Math.max(1, Math.round((nominal - 1) / 4) * 4 + 1);
+/** The profile this installation is configured to drive. */
+export function activeProfile(): I2vProfile {
+  return getI2vProfile(getEnv().VIDEO_MODEL_PROFILE);
+}
+
+/**
+ * Frame count for a duration under the active profile's temporal stride.
+ *
+ * Retains the `wan` name because existing campaign code imports it, but it is
+ * profile-aware: Wan needs 4n+1, LTX needs 8n+1, and using the wrong one fails
+ * inside the VAE on the GPU rather than here.
+ */
+export function wanFrameCount(durationSec: number, fps?: number): number {
+  const profile = activeProfile();
+  if (fps !== undefined && fps !== profile.fps) {
+    // An explicit mismatched fps means the caller is reasoning about a
+    // different profile than the one configured; refuse rather than guess.
+    throw new StudioError(
+      "INVALID_INPUT",
+      `Requested ${fps} fps but profile '${profile.id}' runs at ${profile.fps} fps.`,
+    );
+  }
+  return frameCountFor(profile, durationSec);
 }
 
 /**
@@ -46,11 +71,13 @@ export function wanFrameCount(durationSec: number, fps = WAN_I2V_FPS): number {
  * Until then `health()` reports exactly what is missing.
  */
 export class RemoteWorkerProvider implements VideoProvider {
-  readonly capabilities: ProviderCapabilities = {
+  get capabilities(): ProviderCapabilities {
+    const profile = activeProfile();
+    const largest = largestSize(profile);
+    return {
     id: "remote-worker",
-    label: "Remote GPU worker (Python)",
-    description:
-      "Drives this project's Python worker for direct Diffusers/PyTorch inference on any NVIDIA GPU host.",
+    label: `Remote GPU worker — ${profile.label}`,
+    description: `Drives this project's Python worker on any NVIDIA GPU host. ${profile.summary}`,
     kind: "remote",
     requiresGpu: true,
     requiresApiKey: false,
@@ -63,14 +90,15 @@ export class RemoteWorkerProvider implements VideoProvider {
     supportsSeed: true,
     supportsNegativePrompt: true,
 
-    maxGenerationEdge: 1280,
-    maxFps: 24,
-    maxClipSeconds: 5,
+    maxGenerationEdge: largest.height,
+    maxFps: profile.fps,
+    maxClipSeconds: profile.maxClipSeconds,
     promptStyle: "structured_blocks",
     // T5-class text encoders cap around 512 tokens; past that the model
     // silently truncates and the realism constraints at the tail are lost.
-    maxPromptTokens: 512,
-  };
+    maxPromptTokens: profile.maxPromptTokens,
+    };
+  }
 
   private get baseUrl(): string {
     return getEnv().REMOTE_WORKER_URL.replace(/\/+$/, "");
@@ -125,11 +153,12 @@ export class RemoteWorkerProvider implements VideoProvider {
           info: body,
         };
       }
-      if (body.model_id !== WAN_I2V_MODEL_ID || body.model_profile !== WAN_I2V_PROFILE) {
+      const profile = activeProfile();
+      if (body.model_id !== profile.modelId || body.model_profile !== profile.id) {
         return {
           available: false,
-          detail: `The worker loaded ${body.model_id ?? "an unknown model"}, not the required ${WAN_I2V_MODEL_ID} profile.`,
-          remedy: `Set VIDEO_MODEL_ID=${WAN_I2V_MODEL_ID} and VIDEO_MODEL_PROFILE=${WAN_I2V_PROFILE}, then restart the worker.`,
+          detail: `The worker loaded ${body.model_id ?? "an unknown model"} / ${body.model_profile ?? "no profile"}, but this app is configured for ${profile.modelId} (${profile.id}).`,
+          remedy: `Either set VIDEO_MODEL_ID=${profile.modelId} and VIDEO_MODEL_PROFILE=${profile.id} on the worker, or point this app at the profile the worker is serving.`,
           info: body,
         };
       }
@@ -204,6 +233,8 @@ export class RemoteWorkerProvider implements VideoProvider {
       throw new StudioError("INVALID_INPUT", "Wan 2.2 I2V requires exactly one init_frame image.");
     }
 
+    const profile = activeProfile();
+    const frames = frameCountFor(profile, request.durationSec);
     const payload = {
       request_id: request.requestId,
       shot_id: request.shotId,
@@ -212,8 +243,12 @@ export class RemoteWorkerProvider implements VideoProvider {
       width: request.width,
       height: request.height,
       fps: request.fps,
-      duration_sec: request.durationSec,
-      num_frames: wanFrameCount(request.durationSec, request.fps),
+      // Derive the duration FROM the frame count, never the reverse. The
+      // worker requires num_frames === round(duration_sec * fps), and a stride
+      // of 8 can push the nearest valid count several frames off the planner's
+      // requested length. Sending the derived duration makes them agree exactly.
+      duration_sec: durationForFrames(profile, frames),
+      num_frames: frames,
       seed: request.seed,
       guidance: {
         prompt_adherence: request.guidance.promptAdherence,
@@ -227,10 +262,10 @@ export class RemoteWorkerProvider implements VideoProvider {
       references: [] as Array<Record<string, unknown>>,
       provider_options: {
         ...request.providerOptions,
-        model_profile: WAN_I2V_PROFILE,
-        num_inference_steps: 40,
-        guidance_scale: 5,
-        guidance_scale_2: 5,
+        model_profile: profile.id,
+        num_inference_steps: profile.sampler.numInferenceSteps,
+        guidance_scale: profile.sampler.guidanceScale,
+        guidance_scale_2: profile.sampler.guidanceScale2,
       },
     };
 
@@ -343,7 +378,8 @@ interface WorkerJobResult {
 }
 
 function assertWanRequest(request: GenerationRequest): void {
-  const dimensionsAreSupported = WAN_I2V_VERTICAL_SIZES.some(
+  const profile = activeProfile();
+  const dimensionsAreSupported = profile.sizes.some(
     (size) => size.width === request.width && size.height === request.height,
   );
   if (!dimensionsAreSupported) {
@@ -352,8 +388,11 @@ function assertWanRequest(request: GenerationRequest): void {
       `Wan 2.2 I2V vertical generation must be 720x1280 or 480x832; received ${request.width}x${request.height}.`,
     );
   }
-  if (request.fps !== WAN_I2V_FPS) {
-    throw new StudioError("INVALID_INPUT", `Wan 2.2 I2V is configured at ${WAN_I2V_FPS} fps; received ${request.fps}.`);
+  if (request.fps !== profile.fps) {
+    throw new StudioError(
+      "INVALID_INPUT",
+      `Profile '${profile.id}' runs at ${profile.fps} fps; received ${request.fps}.`,
+    );
   }
 
   const conditioned = request.references.filter((reference) => reference.usage !== "descriptive_only");

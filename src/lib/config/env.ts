@@ -26,6 +26,12 @@ const EnvSchema = z.object({
   COMFYUI_WORKFLOW: z.string().trim().default("worker/workflows/i2v_default.api.json"),
 
   REMOTE_WORKER_URL: z.string().trim().default("http://127.0.0.1:8000"),
+  /**
+   * Which image-to-video profile the worker is serving. Must match the
+   * worker's own VIDEO_MODEL_PROFILE — the health check refuses to run if the
+   * two disagree, since the resolution and frame maths differ per profile.
+   */
+  VIDEO_MODEL_PROFILE: z.string().trim().min(1).default("wan2.2-i2v-a14b-720p"),
   REMOTE_WORKER_TOKEN: z.string().trim().optional(),
 
   STORAGE_DIR: z.string().trim().default("./storage"),
@@ -73,6 +79,7 @@ export function getEnv(): StudioEnv {
     COMFYUI_BASE_URL: blankToUndefined(process.env.COMFYUI_BASE_URL),
     COMFYUI_WORKFLOW: blankToUndefined(process.env.COMFYUI_WORKFLOW),
     REMOTE_WORKER_URL: blankToUndefined(process.env.REMOTE_WORKER_URL),
+    VIDEO_MODEL_PROFILE: blankToUndefined(process.env.VIDEO_MODEL_PROFILE),
     REMOTE_WORKER_TOKEN: blankToUndefined(process.env.REMOTE_WORKER_TOKEN),
     STORAGE_DIR: blankToUndefined(process.env.STORAGE_DIR),
     OUTPUT_DIR: blankToUndefined(process.env.OUTPUT_DIR),

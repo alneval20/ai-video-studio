@@ -174,7 +174,7 @@ class TestJobs:
         ("override", "expected"),
         [
             ({"fps": 30, "num_frames": 89}, "fps must be 24"),
-            ({"width": 464}, "720x1280 or 480x832"),
+            ({"width": 464}, "480x832, 720x1280"),
             ({"references": []}, "exactly one conditioned reference"),
         ],
     )
@@ -428,3 +428,100 @@ class TestAuth:
                 headers={"Authorization": "Bearer wrong"},
             )
             assert res.status_code == 401
+
+
+# ---------------------------------------------------------------- profiles
+
+
+class TestModelProfiles:
+    """
+    The free-tier LTX profile exists so the studio can run on a 16 GB GPU when
+    an 80 GB card is not available. These assert its constraints are genuinely
+    enforced rather than merely declared — a wrong frame count or an
+    off-by-32 dimension fails inside the VAE, on a GPU, minutes in.
+    """
+
+    def test_both_profiles_are_registered(self):
+        from app.model_profiles import LTX_I2V, PROFILES, WAN_I2V
+
+        assert PROFILES[WAN_I2V.profile_id] is WAN_I2V
+        assert PROFILES[LTX_I2V.profile_id] is LTX_I2V
+
+    def test_free_tier_profile_fits_a_16gb_card(self):
+        from app.model_profiles import LTX_I2V
+
+        # A free-tier T4/P100 exposes ~15-16 GiB; leave real headroom.
+        assert LTX_I2V.min_vram_gib <= 12.0
+
+    def test_ltx_vertical_size_is_exactly_9_by_16_and_divisible_by_32(self):
+        from app.model_profiles import LTX_I2V
+
+        assert (576, 1024) in LTX_I2V.sizes
+        # Exact 9:16 — a ratio that is merely "close" letterboxes on Reels.
+        assert 576 / 1024 == 9 / 16
+        for width, height in LTX_I2V.sizes:
+            assert width % 32 == 0 and height % 32 == 0
+
+    def test_unknown_profile_is_rejected_at_the_schema_edge(self):
+        # Rejected by pydantic before it can reach the loader, which is the
+        # stronger guarantee: an unknown profile never selects a pipeline.
+        with pytest.raises(Exception) as excinfo:
+            GenerationRequest.model_validate(
+                make_request(provider_options={"model_profile": "not-a-real-profile"})
+            )
+        assert "model_profile" in str(excinfo.value)
+
+    def test_every_schema_profile_has_a_registered_implementation(self):
+        # The Literal and the registry are declared separately; if they drift,
+        # a request validates at the edge and then dies at load time.
+        import typing
+
+        from app.model_profiles import PROFILES
+        from app.schemas import ModelOptions
+
+        literal = typing.get_args(ModelOptions.model_fields["model_profile"].annotation)
+        assert set(literal) == set(PROFILES)
+
+    def test_ltx_requires_8n_plus_1_frames(self):
+        from app.model_profiles import LTX_I2V, validate_generation_request
+
+        # 73 satisfies both 4n+1 (Wan) and 8n+1 (LTX); 77 satisfies only 4n+1,
+        # so it is exactly the value that would slip through a Wan-shaped check.
+        assert (73 - 1) % 8 == 0
+        assert (77 - 1) % 4 == 0 and (77 - 1) % 8 != 0
+
+        request = GenerationRequest.model_validate(
+            make_request(
+                width=576,
+                height=1024,
+                num_frames=77,
+                duration_sec=77 / 24,
+                provider_options={"model_profile": LTX_I2V.profile_id},
+            )
+        )
+        assert any("8n+1" in e for e in validate_generation_request(request))
+
+    def test_ltx_accepts_a_well_formed_request(self):
+        from app.model_profiles import LTX_I2V, validate_generation_request
+
+        request = GenerationRequest.model_validate(
+            make_request(
+                width=576,
+                height=1024,
+                num_frames=73,
+                duration_sec=3.0,
+                provider_options={"model_profile": LTX_I2V.profile_id},
+            )
+        )
+        assert validate_generation_request(request) == []
+
+    def test_wan_sizes_are_rejected_under_the_ltx_profile(self):
+        from app.model_profiles import LTX_I2V, validate_generation_request
+
+        # 720x1280 is valid for Wan but not divisible by 32, so LTX must refuse it.
+        assert 720 % 32 != 0
+        request = GenerationRequest.model_validate(
+            make_request(provider_options={"model_profile": LTX_I2V.profile_id})
+        )
+        errors = validate_generation_request(request)
+        assert any("size must be one of" in e for e in errors)

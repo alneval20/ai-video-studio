@@ -29,11 +29,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import settings
-from .model_profiles import (
-    WAN_I2V_MODEL_ID,
-    WAN_I2V_PROFILE,
-    WAN_MIN_VRAM_GIB,
-)
+from .model_profiles import PROFILES, ModelProfile, get_profile
 from .schemas import ErrorCode
 
 log = logging.getLogger("worker.pipeline")
@@ -136,18 +132,25 @@ class VideoPipelineManager:
             )
         if not settings.model_id:
             return "No VIDEO_MODEL_ID is configured, so no model can be loaded."
-        if settings.model_id != WAN_I2V_MODEL_ID:
-            return f"Unsupported VIDEO_MODEL_ID '{settings.model_id}'; expected '{WAN_I2V_MODEL_ID}'."
-        if settings.model_profile != WAN_I2V_PROFILE:
+
+        profile = get_profile(settings.model_profile)
+        if profile is None:
             return (
-                f"Unsupported VIDEO_MODEL_PROFILE '{settings.model_profile}'; "
-                f"expected '{WAN_I2V_PROFILE}'."
+                f"Unknown VIDEO_MODEL_PROFILE '{settings.model_profile}'; "
+                f"expected one of: {', '.join(sorted(PROFILES))}."
             )
-        _, total = self.vram_gb()
-        if total is not None and total < WAN_MIN_VRAM_GIB:
+        if settings.model_id != profile.model_id:
             return (
-                f"CUDA GPU exposes {total:.1f} GiB VRAM; the full-quality Wan 2.2 "
-                f"I2V A14B profile requires an 80 GB-class GPU."
+                f"VIDEO_MODEL_ID '{settings.model_id}' does not match profile "
+                f"'{profile.profile_id}', which requires '{profile.model_id}'."
+            )
+
+        _, total = self.vram_gb()
+        if total is not None and total < profile.min_vram_gib:
+            return (
+                f"CUDA GPU exposes {total:.1f} GiB VRAM; profile "
+                f"'{profile.profile_id}' requires at least {profile.min_vram_gib:.0f} GiB. "
+                f"{profile.summary}"
             )
         if self._load_error:
             return f"Model failed to load: {self._load_error}"
@@ -175,37 +178,17 @@ class VideoPipelineManager:
                 )
             if not settings.model_id:
                 raise ModelUnavailable("VIDEO_MODEL_ID is not set.")
-            if settings.model_id != WAN_I2V_MODEL_ID or settings.model_profile != WAN_I2V_PROFILE:
+            profile = get_profile(settings.model_profile)
+            if profile is None or settings.model_id != profile.model_id:
                 raise ModelUnavailable(self.status_detail())
             _, total = self.vram_gb()
-            if total is not None and total < WAN_MIN_VRAM_GIB:
+            if total is not None and total < profile.min_vram_gib:
                 raise ModelUnavailable(self.status_detail())
 
-            try:
-                from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
-            except Exception as exc:  # noqa: BLE001
-                raise ModelUnavailable(
-                    "diffusers with WanImageToVideoPipeline support is not installed: "
-                    f"{exc}"
-                ) from exc
-
-            log.info("Loading %s ...", settings.model_id)
+            log.info("Loading %s (%s) ...", settings.model_id, profile.profile_id)
             started = time.monotonic()
             try:
-                # Wan's VAE is kept in float32 to prevent liquid/glass detail
-                # instability; the two transformer stages run in bfloat16.
-                vae = AutoencoderKLWan.from_pretrained(
-                    settings.model_id,
-                    subfolder="vae",
-                    torch_dtype=torch.float32,
-                    cache_dir=settings.cache_dir,
-                )
-                pipeline = WanImageToVideoPipeline.from_pretrained(
-                    settings.model_id,
-                    vae=vae,
-                    torch_dtype=torch.bfloat16,
-                    cache_dir=settings.cache_dir,
-                )
+                pipeline = self._build_pipeline(profile)
 
                 # CPU offload is an official inference memory strategy, not a
                 # lower-quality model fallback. It trades speed for headroom.
@@ -234,6 +217,60 @@ class VideoPipelineManager:
                         "Use a smaller model or enable WORKER_CPU_OFFLOAD."
                     ) from exc
                 raise ModelUnavailable(f"Could not load {settings.model_id}: {exc}") from exc
+
+    def _build_pipeline(self, profile: ModelProfile) -> Any:
+        """
+        Construct the diffusers pipeline for a profile.
+
+        Each checkpoint family needs its own loading recipe, so this is the one
+        place that knows about specific pipeline classes. Adding a model means
+        adding a branch here plus a `ModelProfile` — nothing above this changes.
+        """
+        assert torch is not None
+        dtype = getattr(torch, profile.dtype)
+
+        if profile.pipeline_class == "WanImageToVideoPipeline":
+            try:
+                from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
+            except Exception as exc:  # noqa: BLE001
+                raise ModelUnavailable(
+                    f"diffusers with WanImageToVideoPipeline support is not installed: {exc}"
+                ) from exc
+
+            # Wan's VAE is kept in float32 to prevent liquid/glass detail
+            # instability; the two transformer stages run in bfloat16.
+            vae = AutoencoderKLWan.from_pretrained(
+                profile.model_id,
+                subfolder="vae",
+                torch_dtype=torch.float32,
+                cache_dir=settings.cache_dir,
+            )
+            return WanImageToVideoPipeline.from_pretrained(
+                profile.model_id,
+                vae=vae,
+                torch_dtype=dtype,
+                cache_dir=settings.cache_dir,
+            )
+
+        if profile.pipeline_class == "LTXImageToVideoPipeline":
+            try:
+                from diffusers import LTXImageToVideoPipeline
+            except Exception as exc:  # noqa: BLE001
+                raise ModelUnavailable(
+                    f"diffusers with LTXImageToVideoPipeline support is not installed: {exc}"
+                ) from exc
+
+            # LTX ships a single VAE that is stable in the transformer's dtype,
+            # so unlike Wan it needs no separate float32 VAE load.
+            return LTXImageToVideoPipeline.from_pretrained(
+                profile.model_id,
+                torch_dtype=dtype,
+                cache_dir=settings.cache_dir,
+            )
+
+        raise ModelUnavailable(
+            f"No loader implemented for pipeline class '{profile.pipeline_class}'."
+        )
 
     def _free_vram(self) -> None:
         """Best-effort VRAM reclaim after an OOM, so the next job can still run."""

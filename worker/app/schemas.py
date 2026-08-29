@@ -76,11 +76,21 @@ class Guidance(BaseModel):
 
 
 class ModelOptions(BaseModel):
-    """Sampler controls for the one supported, verified production profile."""
+    """
+    Sampler controls, scoped to a named model profile.
+
+    `model_profile` stays a closed Literal rather than a free string: it selects
+    the loader, the resolution set and the VAE stride, so an unrecognised value
+    must be rejected at the edge instead of failing deep inside the pipeline.
+    Adding a model means adding it here and in `model_profiles.PROFILES`.
+
+    `guidance_scale_2` applies only to Wan's second MoE expert; single-expert
+    profiles such as LTX ignore it.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    model_profile: Literal["wan2.2-i2v-a14b-720p"]
+    model_profile: Literal["wan2.2-i2v-a14b-720p", "ltx-2b-i2v-576p"]
     num_inference_steps: int = Field(default=40, ge=20, le=60)
     guidance_scale: float = Field(default=5.0, ge=1.0, le=10.0)
     guidance_scale_2: float = Field(default=5.0, ge=1.0, le=10.0)
