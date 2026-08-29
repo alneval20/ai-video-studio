@@ -61,7 +61,10 @@ class Job:
             width=self.request.width if self.status == "succeeded" else None,
             height=self.request.height if self.status == "succeeded" else None,
             fps=self.request.fps if self.status == "succeeded" else None,
+            num_frames=self.request.num_frames if self.status == "succeeded" else None,
+            codec="h264" if self.status == "succeeded" else None,
             model_id=settings.model_id or None,
+            model_profile=settings.model_profile or None,
             device=manager.device,
             queue_ms=int((self.started_at - self.created_at) * 1000)
             if self.started_at
@@ -168,11 +171,6 @@ class JobRegistry:
                 None,
             )
 
-            # Map the normalised 0..1 guidance dials onto sampler parameters.
-            # These curves are the worker's business, not the app's.
-            guidance_scale = 3.0 + req.guidance.prompt_adherence * 6.0
-            steps = int(round(20 + req.guidance.prompt_adherence * 20))
-
             manager.generate(
                 prompt=req.prompt,
                 negative_prompt=req.negative_prompt,
@@ -181,8 +179,9 @@ class JobRegistry:
                 num_frames=req.num_frames,
                 fps=req.fps,
                 seed=req.seed,
-                guidance_scale=guidance_scale,
-                num_inference_steps=steps,
+                guidance_scale=req.provider_options.guidance_scale,
+                guidance_scale_2=req.provider_options.guidance_scale_2,
+                num_inference_steps=req.provider_options.num_inference_steps,
                 init_image_b64=init_frame.image_base64 if init_frame else None,
                 output_path=output,
                 deadline=deadline,

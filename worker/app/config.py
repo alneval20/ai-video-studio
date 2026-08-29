@@ -6,6 +6,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .model_profiles import WAN_I2V_MODEL_ID, WAN_I2V_PROFILE
+
 
 def _bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
@@ -22,10 +24,13 @@ class Settings:
     mutates it.
     """
 
-    #: Hugging Face id of the video model to load, e.g.
-    #: "Wan-AI/Wan2.1-T2V-1.3B-Diffusers" or "Lightricks/LTX-Video".
-    #: Empty means no model — the worker starts and reports honestly.
-    model_id: str = field(default_factory=lambda: os.getenv("VIDEO_MODEL_ID", "").strip())
+    #: This worker intentionally supports one production I2V model/profile.
+    model_id: str = field(
+        default_factory=lambda: os.getenv("VIDEO_MODEL_ID", WAN_I2V_MODEL_ID).strip()
+    )
+    model_profile: str = field(
+        default_factory=lambda: os.getenv("VIDEO_MODEL_PROFILE", WAN_I2V_PROFILE).strip()
+    )
 
     #: Shared bearer token. Empty disables auth (fine on a private LAN, not on
     #: a public IP).

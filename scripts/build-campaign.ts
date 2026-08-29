@@ -10,8 +10,7 @@
  * creative director can author it and every downstream engine behaves exactly
  * as it would with LLM output — including rejecting it if it is malformed.
  *
- *   npx tsx scripts/build-campaign.ts
- *   CAMPAIGN_PROVIDER=remote-worker npx tsx scripts/build-campaign.ts
+ *   node --import tsx scripts/build-campaign.ts
  */
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -123,43 +122,95 @@ const brief = DirectorBrief.parse({
     "Match-day energy is carried entirely by light — green and red practical accents on glass and steel — rather than by sports iconography, so the cafe stays a cafe. Three shots at roughly 3.3s each: fewer, longer takes read as premium and give the video model the temporal room it needs to stay coherent. The final shot settles so the %21 typography can land as a clean compositing layer over held footage.",
 });
 
-/** Assets the campaign expects, by semantic role. */
-const WANTED: Array<{ file: string; role: StoredReference["role"]; note: string }> = [
-  { file: "environment-cafe.jpg", role: "environment", note: "the real cafe counter, lighting and interior identity" },
-  { file: "product-lineup.jpg", role: "product", note: "the five iced drinks — cup geometry and logo placement" },
-  { file: "product-dessert.jpg", role: "food", note: "dessert jar — the campaign covers more than coffee" },
-  { file: "logo.png", role: "logo", note: "official transparent logo, overlay compositing only" },
+/**
+ * Assets the campaign expects, by semantic role.
+ *
+ * Matched by pattern rather than exact filename: two of these are
+ * export-tool UUIDs, and a re-export silently renames them. An exact-string
+ * lookup then reports the reference "missing" and the campaign quietly builds
+ * without it — which is precisely the failure this campaign cannot afford.
+ */
+const WANTED: Array<{
+  match: RegExp;
+  role: StoredReference["role"];
+  note: string;
+  /** A campaign built without this asset is not the campaign. Fail, don't warn. */
+  required: boolean;
+}> = [
+  {
+    match: /^IMG_0510\.jpe?g$/i,
+    role: "environment",
+    note: "the real cafe counter, lighting and interior identity",
+    required: true,
+  },
+  {
+    match: /^cup_of_coffee_HD_preserved\.png$/i,
+    role: "food",
+    note: "upright iced drink and dessert reference; prepared as the I2V init frame before generation",
+    required: true,
+  },
+  {
+    match: /^da543044-[0-9a-f-]+\.png$/i,
+    role: "style",
+    note: "drink variety reference only; its weekday/product labels must never be generated into footage",
+    required: false,
+  },
+  {
+    match: /^logo\.png$/i,
+    role: "logo",
+    note: "official transparent logo, overlay compositing only",
+    required: true,
+  },
 ];
 
 async function main() {
-  const provider = getProvider(process.env.CAMPAIGN_PROVIDER ?? "mock");
+  const provider = getProvider(process.env.CAMPAIGN_PROVIDER ?? "remote-worker");
+  if (!provider.capabilities.producesRealVideo) {
+    throw new Error("The Cup of Coffee campaign cannot be built with a mock provider.");
+  }
   const brand = await getBrand("cup-of-coffee");
-  const assetDir = path.resolve("public/campaign");
+  const assetDir = path.resolve("public");
+
+  const entries = await fs.readdir(assetDir).catch(() => [] as string[]);
 
   const references: StoredReference[] = [];
   const missing: string[] = [];
 
   for (const want of WANTED) {
-    try {
-      const stat = await fs.stat(path.join(assetDir, want.file));
-      references.push({
-        id: `ref_${want.role}`,
-        projectId: "prj_amedspor",
-        filename: want.file,
-        mimeType: want.file.endsWith(".png") ? "image/png" : "image/jpeg",
-        bytes: stat.size,
-        width: null,
-        height: null,
-        role: want.role,
-        roleSource: "user",
-        storagePath: path.join("..", "public", "campaign", want.file),
-        url: `/campaign/${want.file}`,
-        notes: want.note,
-        createdAt: new Date().toISOString(),
-      });
-    } catch {
-      missing.push(want.file);
+    const filename = entries.find((e) => want.match.test(e));
+    if (!filename) {
+      missing.push(`${want.role} (expected ${want.match.source})`);
+      continue;
     }
+
+    const stat = await fs.stat(path.join(assetDir, filename));
+    references.push({
+      id: `ref_${want.role}`,
+      projectId: "prj_amedspor",
+      filename,
+      mimeType: filename.toLowerCase().endsWith(".png") ? "image/png" : "image/jpeg",
+      bytes: stat.size,
+      width: null,
+      height: null,
+      role: want.role,
+      roleSource: "user",
+      source: "public",
+      storagePath: filename,
+      url: `/${encodeURIComponent(filename)}`,
+      notes: want.note,
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  const missingRequired = WANTED.filter(
+    (w) => w.required && !references.some((r) => r.role === w.role),
+  );
+  if (missingRequired.length > 0) {
+    throw new Error(
+      `Required campaign assets are absent from ${assetDir}:\n` +
+        missingRequired.map((w) => `  - ${w.role}: expected ${w.match.source}`).join("\n") +
+        `\nFound: ${entries.filter((e) => !e.startsWith(".")).join(", ") || "(nothing)"}`,
+    );
   }
 
   const { spec, notes } = assembleSpec({
@@ -182,7 +233,6 @@ async function main() {
       maxGenerationEdge: provider.capabilities.maxGenerationEdge,
       maxFps: provider.capabilities.maxFps,
       maxClipSeconds: provider.capabilities.maxClipSeconds,
-      maxPromptTokens: provider.capabilities.maxPromptTokens,
     },
     advanced: {
       shotCount: 3,
@@ -241,7 +291,7 @@ async function main() {
   for (const note of notes) console.log(`  - ${note}`);
 
   if (missing.length > 0) {
-    console.log(`\n!!  ASSETS MISSING — drop these into public/campaign/ and re-run:`);
+    console.log(`\n!!  ASSETS MISSING — restore these files in public/ and re-run:`);
     for (const m of missing) console.log(`      ${m}`);
   }
 }

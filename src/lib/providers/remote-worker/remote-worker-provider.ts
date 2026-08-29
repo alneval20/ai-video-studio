@@ -16,6 +16,20 @@ import type {
 
 const log = createLogger("provider:remote-worker");
 
+export const WAN_I2V_MODEL_ID = "Wan-AI/Wan2.2-I2V-A14B-Diffusers";
+export const WAN_I2V_PROFILE = "wan2.2-i2v-a14b-720p";
+export const WAN_I2V_FPS = 24;
+export const WAN_I2V_VERTICAL_SIZES = [
+  { width: 720, height: 1280 },
+  { width: 480, height: 832 },
+] as const;
+
+/** Wan's temporal VAE requires a 4n+1 frame count. */
+export function wanFrameCount(durationSec: number, fps = WAN_I2V_FPS): number {
+  const nominal = Math.max(1, Math.round(durationSec * fps));
+  return Math.max(1, Math.round((nominal - 1) / 4) * 4 + 1);
+}
+
 /**
  * Adapter for the project's own Python GPU worker (see ./worker).
  *
@@ -43,11 +57,13 @@ export class RemoteWorkerProvider implements VideoProvider {
     producesRealVideo: true,
 
     supportsInitFrame: true,
-    supportedReferenceUsages: ["init_frame", "identity", "style", "descriptive_only"],
+    // Wan I2V accepts one conditioning image. Claiming identity/style slots
+    // would be dishonest: those images were previously uploaded but ignored.
+    supportedReferenceUsages: ["init_frame", "descriptive_only"],
     supportsSeed: true,
     supportsNegativePrompt: true,
 
-    maxGenerationEdge: 832,
+    maxGenerationEdge: 1280,
     maxFps: 24,
     maxClipSeconds: 5,
     promptStyle: "structured_blocks",
@@ -87,6 +103,7 @@ export class RemoteWorkerProvider implements VideoProvider {
         device?: string;
         model_loaded?: boolean;
         model_id?: string | null;
+        model_profile?: string | null;
         detail?: string;
       };
 
@@ -105,6 +122,14 @@ export class RemoteWorkerProvider implements VideoProvider {
           detail: "The worker is up on a GPU but no video model is loaded.",
           remedy:
             "Set VIDEO_MODEL_ID in the worker environment and let it download the weights (see worker/README.md).",
+          info: body,
+        };
+      }
+      if (body.model_id !== WAN_I2V_MODEL_ID || body.model_profile !== WAN_I2V_PROFILE) {
+        return {
+          available: false,
+          detail: `The worker loaded ${body.model_id ?? "an unknown model"}, not the required ${WAN_I2V_MODEL_ID} profile.`,
+          remedy: `Set VIDEO_MODEL_ID=${WAN_I2V_MODEL_ID} and VIDEO_MODEL_PROFILE=${WAN_I2V_PROFILE}, then restart the worker.`,
           info: body,
         };
       }
@@ -162,6 +187,9 @@ export class RemoteWorkerProvider implements VideoProvider {
       diagnostics: [
         `Worker job ${jobId}`,
         result.model_id ? `Model: ${result.model_id}` : "",
+        result.model_profile ? `Profile: ${result.model_profile}` : "",
+        result.num_frames ? `Frames: ${result.num_frames}` : "",
+        result.codec ? `Codec: ${result.codec}` : "",
         result.device ? `Device: ${result.device}` : "",
       ].filter(Boolean),
       metrics: { elapsedMs: Date.now() - started, queueMs: result.queue_ms },
@@ -170,6 +198,12 @@ export class RemoteWorkerProvider implements VideoProvider {
 
   /** Mirrors the JSON contract in worker/app/schemas.py. */
   private async submit(request: GenerationRequest, signal?: AbortSignal): Promise<string> {
+    assertWanRequest(request);
+    const initFrame = request.references.find((reference) => reference.usage === "init_frame");
+    if (!initFrame) {
+      throw new StudioError("INVALID_INPUT", "Wan 2.2 I2V requires exactly one init_frame image.");
+    }
+
     const payload = {
       request_id: request.requestId,
       shot_id: request.shotId,
@@ -179,7 +213,7 @@ export class RemoteWorkerProvider implements VideoProvider {
       height: request.height,
       fps: request.fps,
       duration_sec: request.durationSec,
-      num_frames: Math.max(1, Math.round(request.durationSec * request.fps)),
+      num_frames: wanFrameCount(request.durationSec, request.fps),
       seed: request.seed,
       guidance: {
         prompt_adherence: request.guidance.promptAdherence,
@@ -191,25 +225,31 @@ export class RemoteWorkerProvider implements VideoProvider {
       // Images are sent as base64 so the worker needs no shared filesystem —
       // that is what lets it run on a rented GPU in another datacentre.
       references: [] as Array<Record<string, unknown>>,
-      provider_options: request.providerOptions,
+      provider_options: {
+        ...request.providerOptions,
+        model_profile: WAN_I2V_PROFILE,
+        num_inference_steps: 40,
+        guidance_scale: 5,
+        guidance_scale_2: 5,
+      },
     };
 
-    for (const ref of request.references) {
-      if (ref.usage === "descriptive_only") continue;
-      try {
-        const data = await fs.readFile(ref.path);
-        payload.references.push({
-          id: ref.id,
-          role: ref.role,
-          usage: ref.usage,
-          weight: ref.weight,
-          mime_type: ref.mimeType,
-          image_base64: data.toString("base64"),
-        });
-      } catch (error) {
-        log.warn("Skipping unreadable reference.", { path: ref.path, error: (error as Error).message });
-      }
+    let data: Buffer;
+    try {
+      data = await fs.readFile(initFrame.path);
+    } catch (error) {
+      throw new StudioError("REFERENCE_INVALID", `Could not read init frame ${initFrame.path}.`, {
+        details: (error as Error).message,
+      });
     }
+    payload.references.push({
+      id: initFrame.id,
+      role: initFrame.role,
+      usage: initFrame.usage,
+      weight: initFrame.weight,
+      mime_type: initFrame.mimeType,
+      image_base64: data.toString("base64"),
+    });
 
     const res = await fetch(`${this.baseUrl}/jobs`, {
       method: "POST",
@@ -294,9 +334,35 @@ interface WorkerJobResult {
   width?: number;
   height?: number;
   fps?: number;
+  num_frames?: number;
+  codec?: string;
   model_id?: string;
+  model_profile?: string;
   device?: string;
   queue_ms?: number;
+}
+
+function assertWanRequest(request: GenerationRequest): void {
+  const dimensionsAreSupported = WAN_I2V_VERTICAL_SIZES.some(
+    (size) => size.width === request.width && size.height === request.height,
+  );
+  if (!dimensionsAreSupported) {
+    throw new StudioError(
+      "INVALID_INPUT",
+      `Wan 2.2 I2V vertical generation must be 720x1280 or 480x832; received ${request.width}x${request.height}.`,
+    );
+  }
+  if (request.fps !== WAN_I2V_FPS) {
+    throw new StudioError("INVALID_INPUT", `Wan 2.2 I2V is configured at ${WAN_I2V_FPS} fps; received ${request.fps}.`);
+  }
+
+  const conditioned = request.references.filter((reference) => reference.usage !== "descriptive_only");
+  if (conditioned.length !== 1 || conditioned[0]?.usage !== "init_frame") {
+    throw new StudioError(
+      "INVALID_INPUT",
+      "Wan 2.2 I2V accepts exactly one conditioned reference and it must use init_frame.",
+    );
+  }
 }
 
 export type WorkerErrorCode =

@@ -1,10 +1,10 @@
 import fs from "node:fs/promises";
-import path from "node:path";
 import { fail, ok } from "@/lib/api/http";
 import { StudioError } from "@/lib/core/errors";
 import { ID } from "@/lib/core/ids";
 import { createLogger } from "@/lib/core/logger";
 import { inferReferenceRole } from "@/lib/references/reference-manager";
+import { resolveReferencePath } from "@/lib/references/paths";
 import { sniffImageType } from "@/lib/references/sniff";
 import {
   ACCEPTED_IMAGE_TYPES,
@@ -115,6 +115,7 @@ export async function POST(request: Request) {
         height: null,
         role: parsedRole?.success ? parsedRole.data : inferred.role,
         roleSource: parsedRole?.success ? "user" : "inferred",
+        source: "storage",
         storagePath: toRelative(absolute),
         url: `/api/references/${id}/file`,
         notes: String(form.get(`notes[${index}]`) ?? ""),
@@ -152,8 +153,11 @@ export async function DELETE(request: Request) {
 
     const record = await references.find(id);
     if (record) {
-      const { getEnv } = await import("@/lib/config/env");
-      await fs.unlink(path.join(getEnv().storageDir, record.storagePath)).catch(() => undefined);
+      // Files in /public are project assets, not user uploads; removing a DB
+      // reference must never delete the canonical source image.
+      if (record.source !== "public") {
+        await fs.unlink(resolveReferencePath(record)).catch(() => undefined);
+      }
       await references.remove(id);
     }
     return ok({ removed: Boolean(record) });

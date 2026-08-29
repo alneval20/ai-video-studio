@@ -14,11 +14,13 @@ pydantic>=2.7,<3.0
 python-multipart>=0.0.9
 
 # --- model stack (installed on the GPU host) ---
-diffusers>=0.32.0
-transformers>=4.44.0
+diffusers>=0.35.1
+transformers>=4.49.0
 accelerate>=0.34.0
 safetensors>=0.4.3
 sentencepiece>=0.2.0
+ftfy>=6.2.0
+numpy>=1.26.0
 imageio>=2.34.0
 imageio-ffmpeg>=0.5.1
 Pillow>=10.3.0

@@ -5,6 +5,7 @@ import { getEnv } from "@/lib/config/env";
 import { describeError, StudioError } from "@/lib/core/errors";
 import { ID } from "@/lib/core/ids";
 import { createLogger } from "@/lib/core/logger";
+import { resolveReferencePath } from "@/lib/references/paths";
 import { assembleSpec, createDirector } from "@/lib/director";
 import { compileShot, compileSpec } from "@/lib/prompts/prompt-compiler";
 import { resolveProvider } from "@/lib/providers/registry";
@@ -257,7 +258,7 @@ export async function executeJob(jobId: string, signal?: AbortSignal): Promise<G
     spec,
     clipPaths,
     outputPath: finalOutputPath(job.projectId, job.id),
-    logoPath: logoRef ? path.join(env.storageDir, logoRef.storagePath) : null,
+    logoPath: logoRef ? resolveReferencePath(logoRef) : null,
   });
 
   for (const note of composed.notes) await record(jobId, "info", note);
@@ -549,7 +550,6 @@ function buildProviderReferences(
   shot: Shot,
   refIndex: Map<string, StoredReference>,
 ): ProviderReference[] {
-  const env = getEnv();
   return referencesForShot(spec, shot.id)
     .map((directive) => {
       const stored = refIndex.get(directive.referenceId);
@@ -559,7 +559,7 @@ function buildProviderReferences(
         role: directive.role,
         usage: directive.usage,
         weight: directive.weight,
-        path: path.join(env.storageDir, stored.storagePath),
+        path: resolveReferencePath(stored),
         mimeType: stored.mimeType,
         description: directive.notes || stored.filename,
       } satisfies ProviderReference;

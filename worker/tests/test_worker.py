@@ -19,7 +19,15 @@ from fastapi.testclient import TestClient
 from app.config import settings
 from app.jobs import JobRegistry
 from app.main import app
-from app.pipeline import JobCancelled, JobTimeout, OutOfMemory, WorkerError, _is_oom, manager
+from app.pipeline import (
+    JobCancelled,
+    JobTimeout,
+    ModelUnavailable,
+    OutOfMemory,
+    WorkerError,
+    _is_oom,
+    manager,
+)
 from app.schemas import RETRYABLE_CODES, ErrorCode, GenerationRequest, Guidance
 
 
@@ -35,11 +43,11 @@ def make_request(**overrides) -> dict:
         "shot_id": "shot_1",
         "prompt": "a cup of coffee on a table",
         "negative_prompt": "blurry",
-        "width": 464,
-        "height": 832,
+        "width": 720,
+        "height": 1280,
         "fps": 24,
         "duration_sec": 3.0,
-        "num_frames": 72,
+        "num_frames": 73,
         "seed": 12345,
         "guidance": {
             "prompt_adherence": 0.7,
@@ -48,8 +56,22 @@ def make_request(**overrides) -> dict:
         },
         "camera": {"presetId": "slow_push_in", "moveIntensity": 0.2},
         "motion": {"subjectMotion": "micro"},
-        "references": [],
-        "provider_options": {},
+        "references": [
+            {
+                "id": "r_init",
+                "role": "food",
+                "usage": "init_frame",
+                "weight": 1.0,
+                "mime_type": "image/png",
+                "image_base64": "AA==",
+            }
+        ],
+        "provider_options": {
+            "model_profile": "wan2.2-i2v-a14b-720p",
+            "num_inference_steps": 40,
+            "guidance_scale": 5.0,
+            "guidance_scale_2": 5.0,
+        },
     }
     payload.update(overrides)
     return payload
@@ -61,7 +83,7 @@ def make_request(**overrides) -> dict:
 class TestSchemas:
     def test_accepts_the_canonical_request(self):
         req = GenerationRequest.model_validate(make_request())
-        assert req.num_frames == 72
+        assert req.num_frames == 73
         assert req.guidance.prompt_adherence == pytest.approx(0.7)
 
     def test_rejects_out_of_range_guidance(self):
@@ -138,10 +160,30 @@ class TestHealth:
 
 class TestJobs:
     def test_rejects_frames_that_disagree_with_duration(self, client: TestClient):
-        # 3s x 24fps is 72 frames; 5 would silently produce the wrong length.
+        # Wan requires 4n+1; 5 is valid for the VAE but not a three-second clip.
         res = client.post("/jobs", json=make_request(num_frames=5))
         assert res.status_code == 422
-        assert "inconsistent" in res.json()["detail"]
+        assert "within one frame" in res.json()["detail"]
+
+    def test_rejects_non_4n_plus_1_frames(self, client: TestClient):
+        res = client.post("/jobs", json=make_request(num_frames=72))
+        assert res.status_code == 422
+        assert "4n+1" in res.json()["detail"]
+
+    @pytest.mark.parametrize(
+        ("override", "expected"),
+        [
+            ({"fps": 30, "num_frames": 89}, "fps must be 24"),
+            ({"width": 464}, "720x1280 or 480x832"),
+            ({"references": []}, "exactly one conditioned reference"),
+        ],
+    )
+    def test_rejects_requests_outside_the_wan_profile(
+        self, client: TestClient, override: dict, expected: str
+    ):
+        res = client.post("/jobs", json=make_request(**override))
+        assert res.status_code == 422
+        assert expected in res.json()["detail"]
 
     def test_accepts_a_consistent_request_and_fails_it_honestly(self, client: TestClient):
         res = client.post("/jobs", json=make_request())
@@ -155,6 +197,37 @@ class TestJobs:
         assert state["error_code"] == ErrorCode.MODEL_UNAVAILABLE.value
         assert state["retryable"] is False
         assert state["error"]
+
+    def test_request_response_contract_reaches_a_real_artifact_route(
+        self, client: TestClient, monkeypatch
+    ):
+        captured: dict = {}
+
+        def completed_generation(**kwargs):
+            captured.update(kwargs)
+            kwargs["output_path"].write_bytes(b"contract-artifact")
+            return kwargs["output_path"]
+
+        monkeypatch.setattr(manager, "generate", completed_generation)
+        res = client.post("/jobs", json=make_request())
+        assert res.status_code == 200
+        job_id = res.json()["job_id"]
+        state = _await_terminal(client, job_id)
+
+        assert state["status"] == "succeeded"
+        assert state["width"] == 720
+        assert state["height"] == 1280
+        assert state["fps"] == 24
+        assert state["num_frames"] == 73
+        assert state["codec"] == "h264"
+        assert state["model_profile"] == "wan2.2-i2v-a14b-720p"
+        assert captured["guidance_scale"] == pytest.approx(5.0)
+        assert captured["guidance_scale_2"] == pytest.approx(5.0)
+        assert captured["init_image_b64"] == "AA=="
+
+        artifact = client.get(f"/jobs/{job_id}/artifact")
+        assert artifact.status_code == 200
+        assert artifact.content == b"contract-artifact"
 
     def test_unknown_job_is_404(self, client: TestClient):
         assert client.get("/jobs/wjob_missing").status_code == 404
@@ -300,6 +373,7 @@ class TestPipelineGuards:
                 fps=8,
                 seed=1,
                 guidance_scale=5.0,
+                guidance_scale_2=5.0,
                 num_inference_steps=10,
                 init_image_b64=None,
                 output_path=tmp_path / "out.mp4",
@@ -307,8 +381,20 @@ class TestPipelineGuards:
         assert getattr(excinfo.value, "code", None) is ErrorCode.MODEL_UNAVAILABLE
 
     def test_bad_init_image_is_rejected_not_crashed(self):
-        assert manager._decode_image("not base64 at all!!") is None  # noqa: SLF001
-        assert manager._decode_image(base64.b64encode(b"nope").decode()) is None  # noqa: SLF001
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            with pytest.raises(ModelUnavailable):
+                manager._decode_image("not base64 at all!!")  # noqa: SLF001
+            return
+
+        with pytest.raises(WorkerError) as invalid_base64:
+            manager._decode_image("not base64 at all!!")  # noqa: SLF001
+        assert invalid_base64.value.code is ErrorCode.INVALID_REQUEST
+
+        with pytest.raises(WorkerError) as invalid_image:
+            manager._decode_image(base64.b64encode(b"nope").decode())  # noqa: SLF001
+        assert invalid_image.value.code is ErrorCode.INVALID_REQUEST
 
 
 # ---------------------------------------------------------------- auth

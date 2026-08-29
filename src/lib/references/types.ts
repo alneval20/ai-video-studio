@@ -13,7 +13,9 @@ export const StoredReference = z.object({
   role: ReferenceRole,
   /** Whether the role was chosen by the user or inferred by the system. */
   roleSource: z.enum(["user", "inferred"]),
-  /** Path on disk, relative to STORAGE_DIR. Never an absolute path in the DB. */
+  /** Which immutable root owns storagePath. Missing means legacy STORAGE_DIR. */
+  source: z.enum(["storage", "public"]).optional(),
+  /** Path on disk, relative to its source root. Never an absolute path in the DB. */
   storagePath: z.string().min(1),
   /** URL the UI can render. Served by the references API route. */
   url: z.string().min(1),

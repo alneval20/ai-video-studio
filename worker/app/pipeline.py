@@ -7,11 +7,9 @@ The device detection, VRAM reporting, model loading, memory-saving
 configuration, concurrency control, OOM handling, cancellation, deadline
 enforcement and video export are all real and will run.
 
-The *inference call itself* is written against the Diffusers video-pipeline API
-but has NOT been executed on a GPU as part of this project — there is no NVIDIA
-hardware available here. Argument names vary slightly between pipelines (Wan,
-LTX-Video, CogVideoX), which is why `_call_pipeline` inspects the pipeline's
-signature rather than hardcoding them.
+The inference call is intentionally specialised for Diffusers'
+`WanImageToVideoPipeline`. The local development machine has no NVIDIA GPU, so
+the worker refuses to claim readiness until that exact model is loaded on CUDA.
 
 If no model is configured or CUDA is absent, the worker does not pretend: it
 reports it through /health and /ready, and the TypeScript provider surfaces
@@ -31,6 +29,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import settings
+from .model_profiles import (
+    WAN_I2V_MODEL_ID,
+    WAN_I2V_PROFILE,
+    WAN_MIN_VRAM_GIB,
+)
 from .schemas import ErrorCode
 
 log = logging.getLogger("worker.pipeline")
@@ -133,6 +136,19 @@ class VideoPipelineManager:
             )
         if not settings.model_id:
             return "No VIDEO_MODEL_ID is configured, so no model can be loaded."
+        if settings.model_id != WAN_I2V_MODEL_ID:
+            return f"Unsupported VIDEO_MODEL_ID '{settings.model_id}'; expected '{WAN_I2V_MODEL_ID}'."
+        if settings.model_profile != WAN_I2V_PROFILE:
+            return (
+                f"Unsupported VIDEO_MODEL_PROFILE '{settings.model_profile}'; "
+                f"expected '{WAN_I2V_PROFILE}'."
+            )
+        _, total = self.vram_gb()
+        if total is not None and total < WAN_MIN_VRAM_GIB:
+            return (
+                f"CUDA GPU exposes {total:.1f} GiB VRAM; the full-quality Wan 2.2 "
+                f"I2V A14B profile requires an 80 GB-class GPU."
+            )
         if self._load_error:
             return f"Model failed to load: {self._load_error}"
         if not self.loaded:
@@ -159,32 +175,49 @@ class VideoPipelineManager:
                 )
             if not settings.model_id:
                 raise ModelUnavailable("VIDEO_MODEL_ID is not set.")
+            if settings.model_id != WAN_I2V_MODEL_ID or settings.model_profile != WAN_I2V_PROFILE:
+                raise ModelUnavailable(self.status_detail())
+            _, total = self.vram_gb()
+            if total is not None and total < WAN_MIN_VRAM_GIB:
+                raise ModelUnavailable(self.status_detail())
 
             try:
-                from diffusers import DiffusionPipeline
+                from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
             except Exception as exc:  # noqa: BLE001
-                raise ModelUnavailable(f"diffusers is not installed: {exc}") from exc
+                raise ModelUnavailable(
+                    "diffusers with WanImageToVideoPipeline support is not installed: "
+                    f"{exc}"
+                ) from exc
 
             log.info("Loading %s ...", settings.model_id)
             started = time.monotonic()
             try:
-                pipeline = DiffusionPipeline.from_pretrained(
+                # Wan's VAE is kept in float32 to prevent liquid/glass detail
+                # instability; the two transformer stages run in bfloat16.
+                vae = AutoencoderKLWan.from_pretrained(
                     settings.model_id,
+                    subfolder="vae",
+                    torch_dtype=torch.float32,
+                    cache_dir=settings.cache_dir,
+                )
+                pipeline = WanImageToVideoPipeline.from_pretrained(
+                    settings.model_id,
+                    vae=vae,
                     torch_dtype=torch.bfloat16,
                     cache_dir=settings.cache_dir,
                 )
 
-                # Memory strategy matters more than anything else here: video
-                # pipelines OOM on anything under 24 GB without offload + slicing.
+                # CPU offload is an official inference memory strategy, not a
+                # lower-quality model fallback. It trades speed for headroom.
                 if settings.enable_cpu_offload and hasattr(pipeline, "enable_model_cpu_offload"):
                     pipeline.enable_model_cpu_offload()
                 else:
                     pipeline.to("cuda")
 
                 if settings.enable_vae_slicing:
-                    for method in ("enable_vae_slicing", "enable_vae_tiling"):
-                        if hasattr(pipeline, method):
-                            getattr(pipeline, method)()
+                    for method in ("enable_slicing", "enable_tiling"):
+                        if hasattr(pipeline.vae, method):
+                            getattr(pipeline.vae, method)()
 
                 self._pipeline = pipeline
                 self._load_error = None
@@ -225,6 +258,7 @@ class VideoPipelineManager:
         fps: int,
         seed: int,
         guidance_scale: float,
+        guidance_scale_2: float,
         num_inference_steps: int,
         init_image_b64: str | None,
         output_path: Path,
@@ -258,14 +292,21 @@ class VideoPipelineManager:
                 "width": width,
                 "num_frames": num_frames,
                 "guidance_scale": guidance_scale,
+                "guidance_scale_2": guidance_scale_2,
                 "num_inference_steps": num_inference_steps,
                 "generator": generator,
+                "output_type": "pil",
             }
 
-            if init_image_b64:
-                image = self._decode_image(init_image_b64)
-                if image is not None:
-                    kwargs["image"] = image
+            if not init_image_b64:
+                raise WorkerError(ErrorCode.INVALID_REQUEST, "Wan I2V requires an init image.")
+            image = self._decode_image(init_image_b64)
+            if image.size != (width, height):
+                raise WorkerError(
+                    ErrorCode.INVALID_REQUEST,
+                    f"Init image is {image.width}x{image.height}; expected exactly {width}x{height}.",
+                )
+            kwargs["image"] = image
 
             if on_progress:
                 on_progress(0.05, "Running inference")
@@ -314,10 +355,9 @@ class VideoPipelineManager:
         """
         Calls the pipeline with only the arguments it actually accepts.
 
-        Diffusers video pipelines differ: some take `num_frames`, some
-        `video_length`; not all accept `negative_prompt` or `image`. Filtering
-        against the real signature is what lets one worker drive Wan, LTX and
-        CogVideoX without a per-model branch.
+        Wan's public Diffusers API is inspected once here so a dependency
+        mismatch fails loudly instead of silently dropping a conditioning
+        parameter.
 
         The step callback is also the only place a running diffusion loop can be
         interrupted, so cancellation and the deadline are enforced there.
@@ -326,14 +366,26 @@ class VideoPipelineManager:
         signature = inspect.signature(self._pipeline.__call__)
         accepted = set(signature.parameters)
 
-        if "num_frames" not in accepted and "video_length" in accepted:
-            kwargs["video_length"] = kwargs.pop("num_frames")
+        required = {
+            "prompt",
+            "negative_prompt",
+            "image",
+            "height",
+            "width",
+            "num_frames",
+            "guidance_scale",
+            "guidance_scale_2",
+            "num_inference_steps",
+            "generator",
+        }
+        missing = sorted(required - accepted)
+        if missing:
+            raise ModelUnavailable(
+                "Installed diffusers has an incompatible Wan I2V call signature; "
+                f"missing: {', '.join(missing)}."
+            )
 
         filtered = {k: v for k, v in kwargs.items() if k in accepted and v is not None}
-
-        dropped = sorted(set(kwargs) - set(filtered))
-        if dropped:
-            log.warning("Pipeline does not accept: %s", ", ".join(dropped))
 
         total = int(filtered.get("num_inference_steps", 30))
 
@@ -373,31 +425,48 @@ class VideoPipelineManager:
         renamed only on success.
         """
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = output_path.with_suffix(output_path.suffix + ".part")
+        temp_path = output_path.with_name(f"{output_path.stem}.part.mp4")
 
-        from diffusers.utils import export_to_video
+        import imageio.v2 as imageio
+        import numpy as np
 
         try:
-            export_to_video(frames, str(temp_path), fps=fps)
+            writer = imageio.get_writer(
+                str(temp_path),
+                format="FFMPEG",
+                mode="I",
+                fps=fps,
+                codec="libx264",
+                pixelformat="yuv420p",
+                macro_block_size=None,
+                output_params=["-profile:v", "high", "-movflags", "+faststart"],
+            )
+            try:
+                for frame in frames:
+                    pixels = np.asarray(frame)
+                    if pixels.dtype != np.uint8:
+                        pixels = np.clip(pixels, 0, 255).astype(np.uint8)
+                    writer.append_data(pixels)
+            finally:
+                writer.close()
             temp_path.replace(output_path)
         finally:
             temp_path.unlink(missing_ok=True)
 
     @staticmethod
-    def _decode_image(image_b64: str) -> Any | None:
+    def _decode_image(image_b64: str) -> Any:
         try:
             from PIL import Image
+        except Exception as exc:  # noqa: BLE001
+            raise ModelUnavailable(f"Pillow is not installed: {exc}") from exc
 
+        try:
             raw = base64.b64decode(image_b64, validate=True)
             image = Image.open(io.BytesIO(raw))
             image.verify()  # rejects corrupt/incomplete data before we use it
             return Image.open(io.BytesIO(raw)).convert("RGB")
         except (binascii.Error, ValueError, OSError) as exc:
-            log.warning("Could not decode the init image: %s", exc)
-            return None
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Unexpected error decoding the init image: %s", exc)
-            return None
+            raise WorkerError(ErrorCode.INVALID_REQUEST, f"Could not decode init image: {exc}") from exc
 
 
 manager = VideoPipelineManager()

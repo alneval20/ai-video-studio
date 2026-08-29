@@ -17,6 +17,8 @@ import { describe, expect, it } from "vitest";
 const root = path.resolve(__dirname, "..");
 const schemasPy = fs.readFileSync(path.join(root, "worker/app/schemas.py"), "utf8");
 const mainPy = fs.readFileSync(path.join(root, "worker/app/main.py"), "utf8");
+const modelProfilesPy = fs.readFileSync(path.join(root, "worker/app/model_profiles.py"), "utf8");
+const pipelinePy = fs.readFileSync(path.join(root, "worker/app/pipeline.py"), "utf8");
 const adapterTs = fs.readFileSync(
   path.join(root, "src/lib/providers/remote-worker/remote-worker-provider.ts"),
   "utf8",
@@ -76,6 +78,35 @@ describe("GenerationRequest: TypeScript sends what Python requires", () => {
     for (const field of pythonFields(schemasPy, "ReferenceImage")) {
       expect(adapterTs).toMatch(new RegExp(`\\b${field}\\s*:`));
     }
+  });
+
+  it("sends every explicit Wan sampler option Python declares", () => {
+    for (const field of pythonFields(schemasPy, "ModelOptions")) {
+      expect(adapterTs).toMatch(new RegExp(`\\b${field}\\s*:`));
+    }
+  });
+});
+
+describe("Wan 2.2 production profile", () => {
+  it("pins the same exact model and profile on both sides", () => {
+    expect(adapterTs).toContain('Wan-AI/Wan2.2-I2V-A14B-Diffusers');
+    expect(modelProfilesPy).toContain('Wan-AI/Wan2.2-I2V-A14B-Diffusers');
+    expect(adapterTs).toContain('wan2.2-i2v-a14b-720p');
+    expect(modelProfilesPy).toContain('wan2.2-i2v-a14b-720p');
+  });
+
+  it("uses the real image-to-video pipeline and explicit H.264 export", () => {
+    expect(pipelinePy).toContain("WanImageToVideoPipeline");
+    expect(pipelinePy).toContain('codec="libx264"');
+    expect(pipelinePy).toContain('pixelformat="yuv420p"');
+    expect(pipelinePy).not.toContain("DiffusionPipeline.from_pretrained");
+  });
+
+  it("enforces native vertical, 24 fps and 4n+1 frames before queueing", () => {
+    expect(modelProfilesPy).toContain("(720, 1280)");
+    expect(modelProfilesPy).toContain("WAN_I2V_FPS = 24");
+    expect(modelProfilesPy).toContain("(request.num_frames - 1) % 4");
+    expect(mainPy).toContain("validate_generation_request(request)");
   });
 });
 
@@ -180,7 +211,6 @@ describe("endpoints match", () => {
 });
 
 describe("worker safety invariants", () => {
-  const pipelinePy = fs.readFileSync(path.join(root, "worker/app/pipeline.py"), "utf8");
   const jobsPy = fs.readFileSync(path.join(root, "worker/app/jobs.py"), "utf8");
 
   it("serialises inference — diffusers pipelines are not thread-safe", () => {

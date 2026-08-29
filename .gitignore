@@ -55,3 +55,10 @@ worker/__pycache__/
 **/__pycache__/
 *.pyc
 worker/models/
+
+# Worker runtime artefacts (default WORKER_OUTPUT_DIR).
+/worker_outputs/
+
+# Generated campaign specs: rebuilt by scripts/build-campaign.ts and stamped
+# with a fresh createdAt, so committing them just churns the diff.
+/docs/campaigns/*.json

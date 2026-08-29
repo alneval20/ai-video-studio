@@ -7,7 +7,7 @@ LAN machine, RunPod, Vast.ai, Lambda, or anything else with CUDA.
 
 Run it:
     pip install -r requirements.txt
-    VIDEO_MODEL_ID=Wan-AI/Wan2.1-T2V-1.3B-Diffusers uvicorn app.main:app --host 0.0.0.0 --port 8000
+    VIDEO_MODEL_ID=Wan-AI/Wan2.2-I2V-A14B-Diffusers VIDEO_MODEL_PROFILE=wan2.2-i2v-a14b-720p uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 Then in the TypeScript app's .env.local:
     VIDEO_PROVIDER=remote-worker
@@ -27,6 +27,7 @@ from fastapi.responses import FileResponse
 
 from .config import settings
 from .jobs import registry
+from .model_profiles import validate_generation_request
 from .pipeline import ModelUnavailable, WorkerError, manager, torch
 from .schemas import (
     CancelResponse,
@@ -101,6 +102,7 @@ async def health() -> HealthResponse:
         device=manager.device,
         model_loaded=manager.loaded,
         model_id=settings.model_id or None,
+        model_profile=settings.model_profile or None,
         detail=manager.status_detail(),
         torch_version=getattr(torch, "__version__", None) if torch else None,
         cuda_available=bool(torch and torch.cuda.is_available()),
@@ -128,6 +130,7 @@ async def ready(response: Response) -> ReadyResponse:
         detail=manager.status_detail(),
         device=manager.device,
         model_id=settings.model_id or None,
+        model_profile=settings.model_profile or None,
     )
 
 
@@ -138,16 +141,11 @@ async def ready(response: Response) -> ReadyResponse:
 
 @app.post("/jobs", response_model=JobAccepted, dependencies=[Depends(require_auth)])
 async def create_job(request: GenerationRequest) -> JobAccepted:
-    # Frames and duration must agree, or the caller silently gets a clip of a
-    # different length than the shot plan allocated.
-    expected_frames = round(request.duration_sec * request.fps)
-    if abs(request.num_frames - expected_frames) > max(2, expected_frames * 0.2):
+    violations = validate_generation_request(request)
+    if violations:
         raise HTTPException(
             status_code=422,
-            detail=(
-                f"num_frames ({request.num_frames}) is inconsistent with "
-                f"duration_sec x fps ({expected_frames})."
-            ),
+            detail=" ".join(violations),
         )
 
     # Reclaim expired artifacts opportunistically, so a long-lived worker needs

@@ -166,6 +166,19 @@ See [`worker/workflows/README.md`](worker/workflows/README.md).
 Direct Diffusers/PyTorch inference. Runs on a LAN machine, RunPod, Vast.ai or
 anywhere else with CUDA. See [`worker/README.md`](worker/README.md).
 
+The Cup of Coffee match-day proof is pinned to
+`Wan-AI/Wan2.2-I2V-A14B-Diffusers` and refuses mock output, unsupported frame
+counts, non-native framing, or a smaller fallback model:
+
+```bash
+npm run campaign:test:i2v
+```
+
+It generates only the requested three-second test, quality-checks the raw
+720×1280/24 fps/73-frame clip, then demonstrates clean logo and campaign-copy
+post-production in a 1080×1920/30 fps H.264 export. It does not build the full
+Reel.
+
 The provider panel in the UI reports each backend's live status and exactly what
 is missing.
 
@@ -176,7 +189,8 @@ is missing.
 ```bash
 npm run dev         # development server
 npm run build       # production build
-npm run test        # unit tests (120)
+npm run test        # unit and media-contract tests
+npm run campaign:test:i2v # strict 3-second Wan I2V proof; requires the CUDA worker
 npm run typecheck   # tsc --noEmit
 npm run lint        # eslint
 npm run verify      # all of the above

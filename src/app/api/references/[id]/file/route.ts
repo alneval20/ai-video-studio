@@ -1,8 +1,6 @@
 import fs from "node:fs/promises";
-import path from "node:path";
 import { fail } from "@/lib/api/http";
-import { getEnv } from "@/lib/config/env";
-import { StudioError } from "@/lib/core/errors";
+import { resolveReferencePath } from "@/lib/references/paths";
 import { references } from "@/lib/storage/repositories";
 
 export const runtime = "nodejs";
@@ -13,12 +11,7 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
     const { id } = await context.params;
     const record = await references.require(id);
 
-    const absolute = path.join(getEnv().storageDir, record.storagePath);
-    // Defence in depth: the stored path is ours, but confirm it stays in root.
-    const root = path.resolve(getEnv().storageDir);
-    if (!path.resolve(absolute).startsWith(root)) {
-      throw new StudioError("NOT_FOUND", "Reference is outside the storage root.");
-    }
+    const absolute = resolveReferencePath(record);
 
     const bytes = await fs.readFile(absolute);
     return new Response(new Uint8Array(bytes), {
