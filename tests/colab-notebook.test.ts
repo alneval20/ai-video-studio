@@ -94,3 +94,56 @@ describe("output integrity", () => {
     }
   });
 });
+
+describe("deferred decode (why cell 7 used to hang after 30/30)", () => {
+  it("returns latents from the denoise call instead of decoding inside it", () => {
+    expect(allCode).toContain("output_type='latent'");
+  });
+
+  it("checkpoints the latents so decode can be retried without re-denoising", () => {
+    expect(allCode).toContain("/content/latents_shot2.pt");
+    expect(allCode).toContain("torch.save(");
+  });
+
+  it("releases the transformer before decoding", () => {
+    // Holding ~4 GiB of transformer on a 16 GiB card starves the decode.
+    expect(allCode).toContain("pipe.transformer = None");
+    expect(allCode.indexOf("pipe.transformer = None")).toBeLessThan(
+      allCode.indexOf("vae.decode("),
+    );
+  });
+
+  it("decodes in fp16, not bf16", () => {
+    // The T4 is Turing (sm_75) with no native bf16 path, so the VAE's 3D
+    // convolutions fall back to a very slow kernel and look like a hang.
+    expect(allCode).toContain("vae.to('cuda', dtype=torch.float16)");
+  });
+
+  it("brackets the decode with logging so a stall is locatable", () => {
+    expect(allCode).toContain("VAE DECODE START");
+    expect(allCode).toContain("VAE DECODE DONE");
+  });
+
+  it("still produces frames_out and exports the MP4", () => {
+    expect(allCode).toContain("frames_out = pipe.video_processor.postprocess_video");
+    expect(allCode).toContain("export_to_video(frames_out");
+  });
+});
+
+describe("generation geometry", () => {
+  it("uses a size the LTX VAE can actually accept", () => {
+    // A profile-resolution bug once emitted 720x1280 here, which fails the
+    // notebook's own divisible-by-32 assertion before anything renders.
+    const match = allCode.match(/W, H = (\d+), (\d+)/);
+    expect(match).not.toBeNull();
+    const [w, h] = [Number(match![1]), Number(match![2])];
+    expect(w % 32).toBe(0);
+    expect(h % 32).toBe(0);
+    expect(allCode).toContain(`WIDTH, HEIGHT = ${w}, ${h}`);
+  });
+
+  it("keeps frame count on the 8n+1 temporal stride", () => {
+    const match = allCode.match(/NUM_FRAMES = (\d+)/);
+    expect((Number(match![1]) - 1) % 8).toBe(0);
+  });
+});

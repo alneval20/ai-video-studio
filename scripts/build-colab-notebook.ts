@@ -41,6 +41,23 @@ async function main() {
 
   const provider = getProvider("remote-worker");
   const profile = getI2vProfile(PROFILE_ID);
+
+  // `activeProfile()` resolves VIDEO_MODEL_PROFILE through getEnv(), which has
+  // already memoised the environment by the time main() runs — so the
+  // assignment above never reached it. The spec was being assembled against the
+  // default Wan profile while the rest of this file hardcoded LTX constants,
+  // which wrote a notebook asking for 720x1280 (not divisible by 32) with a
+  // 512-token budget that the 256-token LTX encoder would silently truncate.
+  // Derive the capabilities from the profile actually chosen here instead.
+  const largest = profile.sizes.reduce((a, b) => (b.height > a.height ? b : a));
+  const capabilities = {
+    ...provider.capabilities,
+    maxGenerationEdge: largest.height,
+    supportedGenerationSizes: profile.sizes,
+    maxFps: profile.fps,
+    maxClipSeconds: profile.maxClipSeconds,
+    maxPromptTokens: profile.maxPromptTokens,
+  };
   const brand = await getBrand("cup-of-coffee");
   const { references } = await resolveCampaignReferences();
 
@@ -51,13 +68,13 @@ async function main() {
     brand,
     references,
     provider: {
-      id: provider.capabilities.id,
-      supportsInitFrame: provider.capabilities.supportsInitFrame,
-      supportedReferenceUsages: provider.capabilities.supportedReferenceUsages,
-      maxGenerationEdge: provider.capabilities.maxGenerationEdge,
-      supportedGenerationSizes: provider.capabilities.supportedGenerationSizes,
-      maxFps: provider.capabilities.maxFps,
-      maxClipSeconds: provider.capabilities.maxClipSeconds,
+      id: capabilities.id,
+      supportsInitFrame: capabilities.supportsInitFrame,
+      supportedReferenceUsages: capabilities.supportedReferenceUsages,
+      maxGenerationEdge: capabilities.maxGenerationEdge,
+      supportedGenerationSizes: capabilities.supportedGenerationSizes,
+      maxFps: capabilities.maxFps,
+      maxClipSeconds: capabilities.maxClipSeconds,
     },
     advanced: {
       shotCount: 3,
@@ -71,11 +88,27 @@ async function main() {
     },
   });
 
-  const compiled = compileSpec(spec, provider.capabilities);
+  const compiled = compileSpec(spec, capabilities);
   // Shot 2 is the macro on the iced latte — the shot the prepared init frame
   // actually depicts, so it is the honest first test of image conditioning.
   const shot = compiled.shots[1];
   const size = spec.delivery.generation;
+
+  // Fail loudly rather than emit a notebook that cannot run.
+  if (!profile.sizes.some((c) => c.width === size.width && c.height === size.height)) {
+    throw new Error(
+      `Refusing to write the notebook: ${size.width}x${size.height} is not a valid generation size for ${profile.id}.`,
+    );
+  }
+  // Not fatal — the run still produces real video — but the tail of the prompt
+  // (the REALISM block) is being dropped by the encoder, so say so out loud
+  // rather than letting it pass silently as it has been.
+  if (shot.approxTokens > profile.maxPromptTokens) {
+    console.warn(
+      `  WARNING   prompt is ${shot.approxTokens} tokens but MAX_SEQ is ${profile.maxPromptTokens}; ` +
+        `the last ~${shot.approxTokens - profile.maxPromptTokens} tokens are truncated by the encoder.`,
+    );
+  }
   const frames = frameCountFor(profile, TEST_DURATION_SEC);
   const duration = durationForFrames(profile, frames);
 
@@ -361,16 +394,23 @@ async function main() {
       ),
 
       md(
-        "## 7 · Generate",
+        "## 7 · Denoise → latents",
         "",
-        "Uses the embeddings from 6a — no text encoder is present in memory. This is",
-        "the real diffusion run. _~3–6 minutes on a T4._",
+        "`output_type='latent'` makes `pipe()` return as soon as step 30/30 finishes.",
+        "Decoding is deferred to the next cell so a slow decode can no longer look",
+        "like a hung generation, and the latents are checkpointed to `/content` so",
+        "decode can be retried without paying for denoising again. _~3–6 min on a T4._",
       ),
       code(
-        "import time",
+        "# output_type='latent' makes pipe() return the moment step 30/30 finishes,",
+        "# so it can no longer hang inside the VAE decode.",
+        "import time, torch",
+        "",
+        "LATENT_CKPT = '/content/latents_shot2.pt'",
         "",
         "generator = torch.Generator(device='cuda').manual_seed(SEED)",
         "started = time.time()",
+        "print('denoising -> latents only (VAE decode deferred to the next cell)', flush=True)",
         "",
         "result = pipe(",
         "    image=init_frame,",
@@ -384,21 +424,136 @@ async function main() {
         "    num_inference_steps=STEPS,",
         "    guidance_scale=GUIDANCE,",
         "    generator=generator,",
+        "    output_type='latent',",
         ")",
         "",
-        "frames_out = result.frames[0]",
-        "print(f'generated {len(frames_out)} frames in {(time.time()-started)/60:.1f} min')",
+        "latents = result.frames if torch.is_tensor(result.frames) else result.frames[0]",
+        "torch.save(",
+        "    {'latents': latents.detach().to(torch.float32).cpu(), 'stage': 'packed',",
+        "     'width': WIDTH, 'height': HEIGHT, 'num_frames': NUM_FRAMES, 'seed': SEED},",
+        "    LATENT_CKPT,",
+        ")",
+        "print(f'denoised in {(time.time() - started) / 60:.1f} min')",
+        "print(f'latents {tuple(latents.shape)} checkpointed -> {LATENT_CKPT}')",
+        "print('Decode can now be retried as often as needed without redoing this.')",
       ),
 
-      md("## 8 · Export H.264 MP4"),
-      code(
-        "from diffusers.utils import export_to_video",
-        "import pathlib",
+      md(
+        "## 8 · Decode on the T4, then export H.264 MP4",
         "",
+        "Two things make this survivable on a free T4. The transformer is released",
+        "first — holding it resident starves the decode on a 16 GiB card. And the VAE",
+        "runs in **fp16**, not bf16: the T4 is Turing (sm_75) and has no native bf16",
+        "datapath, so its 3D convolutions fall back to a very slow kernel.",
+      ),
+      code(
+        "import gc, inspect, pathlib, time, torch",
+        "",
+        "LATENT_CKPT = '/content/latents_shot2.pt'",
+        "blob = torch.load(LATENT_CKPT, map_location='cpu')",
+        "lat = blob['latents']",
+        "print(f'loaded {blob[\"stage\"]} latents {tuple(lat.shape)}', flush=True)",
+        "",
+        "# Read geometry BEFORE releasing the transformer \u2014 two of these are read off",
+        "# transformer.config and would raise once it is gone.",
+        "try:",
+        "    sp = pipe.vae_spatial_compression_ratio",
+        "    tp = pipe.vae_temporal_compression_ratio",
+        "    psp = pipe.transformer_spatial_patch_size",
+        "    ptp = pipe.transformer_temporal_patch_size",
+        "except AttributeError:",
+        "    sp, tp, psp, ptp = 32, 8, 1, 1",
+        "print(f'geometry: spatial /{sp}, temporal /{tp}, patch {psp}/{ptp}')",
+        "",
+        "# Denoising is finished, so the transformer is dead weight. Holding ~4 GiB of",
+        "# it on a 16 GiB card while the VAE decodes 73 frames is what starves decode.",
+        "if getattr(pipe, 'transformer', None) is not None:",
+        "    pipe.transformer.to('cpu')",
+        "    pipe.transformer = None",
+        "gc.collect()",
+        "torch.cuda.empty_cache()",
+        "print(f'VRAM after releasing transformer: {torch.cuda.memory_allocated()/2**30:.2f} GiB')",
+        "",
+        "vae = pipe.vae",
+        "# fp16, NOT bf16. The T4 is Turing (sm_75) with no native bf16 datapath, so the",
+        "# VAE's 3D convolutions fall back to an extremely slow kernel \u2014 a decode that",
+        "# looks like a hang. fp16 is native on this card.",
+        "vae.to('cuda', dtype=torch.float16)",
+        "try:",
+        "    vae.enable_tiling(",
+        "        tile_sample_min_height=256, tile_sample_min_width=256,",
+        "        tile_sample_min_num_frames=16,",
+        "        tile_sample_stride_height=192, tile_sample_stride_width=192,",
+        "        tile_sample_stride_num_frames=8,",
+        "    )",
+        "    print('VAE tiling enabled (spatial + temporal)')",
+        "except TypeError:",
+        "    vae.enable_tiling()",
+        "    print('VAE tiling enabled (defaults \u2014 older diffusers signature)')",
+        "",
+        "if blob['stage'] == 'packed':",
+        "    lat_f = (blob['num_frames'] - 1) // tp + 1",
+        "    lat_h, lat_w = blob['height'] // sp, blob['width'] // sp",
+        "    lat = pipe._unpack_latents(lat, lat_f, lat_h, lat_w, psp, ptp)",
+        "    mean = getattr(vae, 'latents_mean', None)",
+        "    std = getattr(vae, 'latents_std', None)",
+        "    if mean is None:",
+        "        mean = torch.tensor(vae.config.latents_mean)",
+        "        std = torch.tensor(vae.config.latents_std)",
+        "    lat = pipe._denormalize_latents(lat, mean, std, vae.config.scaling_factor)",
+        "    print(f'unpacked -> {tuple(lat.shape)}  (B, C, frames, h, w)')",
+        "",
+        "lat = lat.to('cuda', dtype=torch.float16)",
+        "",
+        "# Timestep conditioning, using the pipeline's own defaults so the result",
+        "# matches what pipe() would have produced.",
+        "timestep = None",
+        "if getattr(vae.config, 'timestep_conditioning', False):",
+        "    params = inspect.signature(type(pipe).__call__).parameters",
+        "    dt = params['decode_timestep'].default",
+        "    dns = params['decode_noise_scale'].default",
+        "    dt = dt[0] if isinstance(dt, (list, tuple)) else dt",
+        "    dns = dt if dns is None else (dns[0] if isinstance(dns, (list, tuple)) else dns)",
+        "    if blob['stage'] == 'packed':   # 'ready' latents were already noise-mixed",
+        "        g = torch.Generator(device='cuda').manual_seed(blob['seed'])",
+        "        noise = torch.randn(lat.shape, generator=g, device='cuda', dtype=lat.dtype)",
+        "        lat = (1 - dns) * lat + dns * noise",
+        "    timestep = torch.tensor([dt], device='cuda', dtype=lat.dtype)",
+        "    print(f'timestep conditioning on: t={dt}, noise_scale={dns}')",
+        "",
+        "def _decode(x, ts):",
+        "    with torch.no_grad():",
+        "        return vae.decode(x, ts, return_dict=False)[0] if ts is not None \\",
+        "            else vae.decode(x, return_dict=False)[0]",
+        "",
+        "print('=========== VAE DECODE START ===========', flush=True)",
+        "t0 = time.time()",
+        "try:",
+        "    video = _decode(lat, timestep)",
+        "except torch.cuda.OutOfMemoryError:",
+        "    torch.cuda.empty_cache()",
+        "    print('tiled decode OOMed \u2014 falling back to temporal chunks', flush=True)",
+        "    F, segs, i = lat.shape[2], [], 0",
+        "    while i < F:",
+        "        j = min(i + 2, F)",
+        "        lo = max(0, i - 1)",
+        "        v = _decode(lat[:, :, lo:j], timestep)",
+        "        drop = 0 if i == 0 else (i - lo - 1) * tp + 1",
+        "        segs.append(v[:, :, drop:].float().cpu())",
+        "        del v",
+        "        torch.cuda.empty_cache()",
+        "        print(f'  latent frames {i}->{j} decoded ({time.time()-t0:.0f}s)', flush=True)",
+        "        i = j",
+        "    video = torch.cat(segs, dim=2)",
+        "print(f'=========== VAE DECODE DONE in {time.time()-t0:.1f}s ===========', flush=True)",
+        "",
+        "frames_out = pipe.video_processor.postprocess_video(video.float().cpu(), output_type='pil')[0]",
+        "print(f'generated {len(frames_out)} frames')",
+        "",
+        "from diffusers.utils import export_to_video",
         "OUT = pathlib.Path('/content/outputs')",
         "OUT.mkdir(parents=True, exist_ok=True)",
         "mp4 = OUT / 'amedspor_ltx_i2v_576x1024.mp4'",
-        "",
         "export_to_video(frames_out, str(mp4), fps=FPS)",
         "print(f'{mp4}  ({mp4.stat().st_size/1024:.0f} KB)')",
       ),
