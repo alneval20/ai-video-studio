@@ -78,8 +78,12 @@ export async function checkTools(force = false): Promise<ToolAvailability> {
 
   const bundled = await bundledPaths();
   const bundledOk = {
-    ffmpeg: bundled.ffmpeg ? await probeBinary(bundled.ffmpeg) : { ok: false, version: null },
-    ffprobe: bundled.ffprobe ? await probeBinary(bundled.ffprobe) : { ok: false, version: null },
+    ffmpeg: bundled.ffmpeg
+      ? await probeBinary(bundled.ffmpeg)
+      : { ok: false, version: null, transient: false },
+    ffprobe: bundled.ffprobe
+      ? await probeBinary(bundled.ffprobe)
+      : { ok: false, version: null, transient: false },
   };
 
   const ffmpegPath = system.ffmpeg.ok ? env.FFMPEG_PATH : bundledOk.ffmpeg.ok ? bundled.ffmpeg : null;
@@ -94,7 +98,7 @@ export async function checkTools(force = false): Promise<ToolAvailability> {
   const usingSystem = system.ffmpeg.ok && system.ffprobe.ok;
   const usingBundled = !system.ffmpeg.ok && !system.ffprobe.ok && Boolean(ffmpegPath && ffprobePath);
 
-  cachedAvailability = {
+  const availability: ToolAvailability = {
     ffmpeg: Boolean(ffmpegPath),
     ffprobe: Boolean(ffprobePath),
     version: system.ffmpeg.ok ? system.ffmpeg.version : bundledOk.ffmpeg.version,
@@ -104,7 +108,16 @@ export async function checkTools(force = false): Promise<ToolAvailability> {
         ? undefined
         : "Install FFmpeg — on macOS: `brew install ffmpeg`. (The bundled fallback failed to run.)",
   };
-  return cachedAvailability;
+
+  // Only memoise a definite answer. Caching a probe that merely timed out
+  // would disable FFmpeg for the whole process on one unlucky spawn.
+  const undecided =
+    system.ffmpeg.transient ||
+    system.ffprobe.transient ||
+    bundledOk.ffmpeg.transient ||
+    bundledOk.ffprobe.transient;
+  if ((ffmpegPath && ffprobePath) || !undecided) cachedAvailability = availability;
+  return availability;
 }
 
 /** Absolute path to whichever ffmpeg/ffprobe won resolution. */
@@ -113,12 +126,24 @@ export async function toolPath(tool: "ffmpeg" | "ffprobe"): Promise<string | nul
   return resolvedPaths[tool];
 }
 
-async function probeBinary(bin: string): Promise<{ ok: boolean; version: string | null }> {
+interface ProbeResult {
+  ok: boolean;
+  version: string | null;
+  /** True when the probe failed for a reason that says nothing about the tool. */
+  transient: boolean;
+}
+
+async function probeBinary(bin: string): Promise<ProbeResult> {
   try {
-    const { stdout } = await run(bin, ["-version"], { timeout: 5000 });
-    return { ok: true, version: stdout.split("\n")[0]?.trim() ?? null };
-  } catch {
-    return { ok: false, version: null };
+    // 5s was too tight: a cold spawn under parallel load times out, and the
+    // result used to be cached as "missing" for the rest of the process.
+    const { stdout } = await run(bin, ["-version"], { timeout: 30_000 });
+    return { ok: true, version: stdout.split("\n")[0]?.trim() ?? null, transient: false };
+  } catch (error) {
+    // ENOENT is a real answer: the binary is not there. A timeout or a failure
+    // to fork under load is not an answer at all and must not be remembered.
+    const code = (error as NodeJS.ErrnoException).code;
+    return { ok: false, version: null, transient: code !== "ENOENT" };
   }
 }
 
