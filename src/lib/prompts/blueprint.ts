@@ -276,6 +276,15 @@ export function trimBlueprint(
   // shortens it to a floor that still carries its meaning.
   const steps: Array<{ label: string; apply: () => void }> = [
     { label: "aesthetic notes", apply: () => void (next.aesthetic = []) },
+    // Reference prose is the first heavy thing to go on a tight budget. When a
+    // reference is genuinely conditioning the model (an init frame) the words
+    // are redundant; when it degraded to descriptive_only the words are a weak
+    // substitute that costs more tokens than the signal they carry.
+    {
+      label: "reference detail",
+      apply: () =>
+        void (next.references = next.references.map((r) => r.split(". Preserve ")[0] + ".")),
+    },
     { label: "atmosphere detail", apply: () => void (next.atmosphere = next.atmosphere.slice(0, 1)) },
     { label: "continuity notes", apply: () => void (next.consistency = next.consistency.slice(0, 2)) },
     { label: "physics detail", apply: () => void (next.motion = next.motion.slice(0, 2)) },
@@ -288,6 +297,7 @@ export function trimBlueprint(
     { label: "lighting detail", apply: () => void (next.lighting = next.lighting.slice(0, 1)) },
     { label: "camera detail", apply: () => void (next.camera = next.camera.slice(0, 3)) },
     { label: "subject detail", apply: () => void (next.subjects = next.subjects.slice(0, 2)) },
+    { label: "secondary references", apply: () => void (next.references = next.references.slice(0, 1)) },
     // Below here the budget is genuinely tight (a CLIP-class 77-token encoder,
     // say). Keep cutting rather than let the model truncate arbitrarily.
     { label: "continuity", apply: () => void (next.consistency = []) },
@@ -296,6 +306,7 @@ export function trimBlueprint(
     { label: "realism constraints", apply: () => void (next.realism = next.realism.slice(0, 3)) },
     { label: "camera detail", apply: () => void (next.camera = next.camera.slice(0, 2)) },
     { label: "subject detail", apply: () => void (next.subjects = next.subjects.slice(0, 1)) },
+    { label: "references", apply: () => void (next.references = []) },
     { label: "lighting", apply: () => void (next.lighting = []) },
     { label: "physics detail", apply: () => void (next.motion = []) },
     { label: "negative constraints", apply: () => void (next.negatives = next.negatives.slice(0, 3)) },

@@ -77,7 +77,13 @@ export const LTX_I2V: I2vProfile = {
   spatialStride: 32,
   minVramGib: 10,
   maxClipSeconds: 5,
-  maxPromptTokens: 512,
+  // The LTX pipeline defaults max_sequence_length to 128, which silently
+  // truncates a compiled prompt at the tail — dropping exactly the realism
+  // constraints the trimmer ranks last. We compile to 256 and pass
+  // max_sequence_length=256 explicitly, so the whole prompt is encoded and any
+  // dropping is done deliberately by our trimmer rather than arbitrarily by
+  // the tokenizer.
+  maxPromptTokens: 256,
   // LTX is distilled and needs far fewer steps than Wan; running it at 40
   // wastes time on a free GPU without improving the result.
   sampler: { numInferenceSteps: 30, guidanceScale: 5, guidanceScale2: 5 },
